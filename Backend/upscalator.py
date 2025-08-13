@@ -22,10 +22,14 @@ class MangaUpscaler:
             self.model = ESRUpscaler().to(self.device)
 
         model_or_chkpt = torch.load(config.upscaler_path, map_location=self.device, weights_only=False)
-        if config.upscaler_path.endswith(".pt"):
-            self.model.generator = model_or_chkpt
+
+        if config.upscaler_type == 'GigaGAN':
+            self.model.load_state_dict(model_or_chkpt, strict=True)
         else:
-            self.model.generator.load_state_dict(model_or_chkpt, strict=True)
+            if config.upscaler_path.endswith(".pt"):
+                self.model.generator = model_or_chkpt
+            else:
+                self.model.generator.load_state_dict(model_or_chkpt, strict=True)
 
         self.model = self.model.eval()
 

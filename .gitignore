@@ -4,3 +4,6 @@ Backendx/networks/generator.zip
 Backendx/manga/*
 .vs/
 
+settings.json
+Backend/.DS_Store
+Backend/networks/generator.zip
