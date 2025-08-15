@@ -10,6 +10,9 @@ import queue
 import json
 from collections import deque
 import webbrowser
+import random
+import glob
+from PIL import ImageTk
 
 import PIL.Image
 import numpy as np
@@ -231,10 +234,129 @@ class ColorizerApp(tk.Tk):
         bug_report_label.grid(row=0, column=0, sticky="w", padx=5) # Align to the west (left)
         bug_report_label.bind("<Button-1>", self.open_bug_report_link)
 
-        # Clear log button
-        clear_button = ttk.Button(bottom_bar_frame, text="Clear Log", command=self.clear_log)
-        clear_button.grid(row=0, column=1, sticky="e") # Align to the east (right)
+        # --- Button container for the right side ---
+        button_container = ttk.Frame(bottom_bar_frame)
+        button_container.grid(row=0, column=1, sticky="e")
 
+        # Preview button
+        preview_button = ttk.Button(button_container, text="Preview", command=self.open_preview_window)
+        preview_button.pack(side=tk.LEFT, padx=(0, 5))
+
+        # Clear log button
+        clear_button = ttk.Button(button_container, text="Clear Log", command=self.clear_log)
+        clear_button.pack(side=tk.LEFT)
+
+
+    def open_preview_window(self):
+        # --- 1. Get the user-selected input folder and images ---
+        image_folder = self.input_folder.get().strip().strip("'\"")
+        if not image_folder or not os.path.isdir(image_folder):
+            self.log("[!] Please select a valid input folder first to use the preview.")
+            return
+
+        supported_ext = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
+        image_paths = [os.path.join(image_folder, f) for f in os.listdir(image_folder) if f.lower().endswith(supported_ext)]
+
+        if not image_paths:
+            self.log(f"[!] No images found in '{os.path.basename(image_folder)}' for preview.")
+            return
+
+        # --- 2. Create the window ---
+        preview_window = tk.Toplevel(self)
+        preview_window.title("Colorizer Preview")
+        preview_window.transient(self)
+        preview_window.grab_set()
+
+        main_frame = ttk.Frame(preview_window, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(1, weight=1) # Allow image labels to expand
+
+        # --- 3. Create Widgets ---
+        ttk.Label(main_frame, text="Original", font=("Helvetica", 12, "bold")).grid(row=0, column=0, pady=(0, 5))
+        ttk.Label(main_frame, text="Colorized", font=("Helvetica", 12, "bold")).grid(row=0, column=1, pady=(0, 5))
+
+        original_label = ttk.Label(main_frame)
+        original_label.grid(row=1, column=0, padx=5, pady=5, sticky="nsew")
+        colorized_label = ttk.Label(main_frame)
+        colorized_label.grid(row=1, column=1, padx=5, pady=5, sticky="nsew")
+
+        repick_button = ttk.Button(main_frame, text="Repick")
+        repick_button.grid(row=2, column=0, columnspan=2, pady=(10, 0))
+
+        # --- 4. Define the core worker function ---
+        def load_and_colorize_image(image_path):
+            original_cwd = os.getcwd()
+            try:
+                # Disable button and set loading text (via main thread)
+                def set_loading_state():
+                    repick_button.config(state="disabled")
+                    original_label.config(image='', text="Loading...")
+                    colorized_label.config(image='', text="Loading...")
+                self.after(0, set_loading_state)
+
+                # --- Actual work in thread ---
+                os.chdir(backend_path)
+                self._update_config_from_gui()
+                colorizer, _, denoiser = self._get_and_manage_models()
+
+                if not colorizer:
+                    self.log("[!] Colorizer model could not be loaded.")
+                    self.after(0, preview_window.destroy)
+                    return
+
+                original_image_pil = PIL.Image.open(image_path).convert("RGB")
+                image_np = np.array(original_image_pil)
+
+                # Denoise step
+                if self.config.denoise and denoiser:
+                    self.after(0, lambda: colorized_label.config(text="Denoising..."))
+                    image_np = denoiser.denoise(image_np, self.config.denoise_sigma)
+
+                self.after(0, lambda: colorized_label.config(text="Colorizing..."))
+
+                target_width = self.config.colorized_image_size
+                original_width = image_np.shape[1]
+                effective_width = min(original_width, target_width)
+                adjusted_width = effective_width - (effective_width % 32)
+                if adjusted_width == 0: adjusted_width = 32
+
+                colorizer.set_image((image_np.astype('float32') / 255), adjusted_width)
+                colorized_image_np = colorizer.colorize()
+                colorized_image_pil = PIL.Image.fromarray(colorized_image_np)
+
+                max_size = (512, 768)
+                original_image_pil.thumbnail(max_size, PIL.Image.Resampling.LANCZOS)
+                colorized_image_pil.thumbnail(max_size, PIL.Image.Resampling.LANCZOS)
+
+                original_photo = ImageTk.PhotoImage(original_image_pil)
+                colorized_photo = ImageTk.PhotoImage(colorized_image_pil)
+
+                # --- Update GUI in main thread ---
+                def update_gui_images():
+                    original_label.config(image=original_photo, text="")
+                    original_label.image = original_photo
+                    colorized_label.config(image=colorized_photo, text="")
+                    colorized_label.image = colorized_photo
+                self.after(0, update_gui_images)
+
+            except Exception as e:
+                self.log(f"[!!!] Failed to create preview for {os.path.basename(image_path)}. Error: {e}")
+                self.after(0, preview_window.destroy)
+            finally:
+                os.chdir(original_cwd)
+                # Re-enable button in main thread
+                self.after(0, lambda: repick_button.config(state="normal"))
+
+        # --- 5. Define the button command ---
+        def start_new_pick():
+            new_path = random.choice(image_paths)
+            self.log(f"[*] Previewing random image: {os.path.basename(new_path)}")
+            threading.Thread(target=lambda: load_and_colorize_image(new_path), daemon=True).start()
+
+        repick_button.config(command=start_new_pick)
+        start_new_pick() # Initial load
 
     def open_advanced_settings(self):
         adv_window = tk.Toplevel(self)

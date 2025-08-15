@@ -3,6 +3,7 @@
 This project provides a standalone desktop application with a graphical user interface (GUI) for the [Manga-Colorizer](https://github.com/BinitDOX/Manga-Colorizer). It functions as a UI wrapper, removing the original client/server architecture that required running a backend server and a browser-based front end (like Firefox, Safari, or Chrome).
 
 ![App Screenshot](Screenshot/ss1.png)
+![Preview Screenshot](Screenshot/ss2.png)
 
 Unlike the original version which colorized images directly on websites, this application allows you to process local image files from any folder on your computer. This provides a streamlined, offline-first workflow for colorizing, denoising, and upscaling your manga pages, allowing you to process entire folders of images with just a few clicks.
 
