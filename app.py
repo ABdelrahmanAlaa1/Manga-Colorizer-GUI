@@ -17,6 +17,8 @@ from PIL import ImageTk
 import PIL.Image
 import numpy as np
 
+MAX_INPUT_WIDTH = 1184
+
 # --- Path Setup (Adjusted for root directory) ---
 # Get the directory of the current script (which is now the project root)
 # and join it with 'Backend' to get the correct path.
@@ -28,6 +30,35 @@ from colorizator import MangaColorizator
 from denoisator import MangaDenoiser
 from upscalator import MangaUpscaler
 from utils.utils import distance_from_grayscale, save_image, clear_torch_cache
+
+
+def transfer_luminance_from_source(source_rgb, colorized_rgb):
+    """Merge original luminance with colorized chroma to preserve gradients at native resolution."""
+    if source_rgb.shape[2] != 3 or colorized_rgb.shape[2] != 3:
+        return colorized_rgb
+
+    if source_rgb.shape[:2] != colorized_rgb.shape[:2]:
+        colorized_rgb = np.array(
+            PIL.Image.fromarray(colorized_rgb).resize(
+                (source_rgb.shape[1], source_rgb.shape[0]),
+                PIL.Image.Resampling.LANCZOS
+            )
+        )
+
+    source = source_rgb.astype(np.float32) / 255.0
+    colorized = colorized_rgb.astype(np.float32) / 255.0
+
+    y = 0.299 * source[..., 0] + 0.587 * source[..., 1] + 0.114 * source[..., 2]
+    u = -0.14713 * colorized[..., 0] - 0.28886 * colorized[..., 1] + 0.436 * colorized[..., 2]
+    v = 0.615 * colorized[..., 0] - 0.51499 * colorized[..., 1] - 0.10001 * colorized[..., 2]
+
+    r = y + 1.13983 * v
+    g = y - 0.39465 * u - 0.58060 * v
+    b = y + 2.03211 * u
+
+    merged = np.stack([r, g, b], axis=-1)
+    merged = np.clip(merged, 0.0, 1.0)
+    return (merged * 255.0).round().astype(np.uint8)
 
 
 # --- Core Processing Logic ---
@@ -60,16 +91,36 @@ def process_image(image_path, output_folder, colorizer, upscaler, denoiser, conf
 
         start_time = time.time()
 
+        requested_limit = getattr(config, 'input_image_size', 0)
+        input_limit = min(requested_limit, MAX_INPUT_WIDTH) if requested_limit else 0
+        if requested_limit and requested_limit > MAX_INPUT_WIDTH:
+            progress_queue.put({'type': 'log', 'message': f"[*] Input clamp capped at {MAX_INPUT_WIDTH}px (requested {requested_limit}px)."})
+
+        if input_limit and image.shape[1] > input_limit:
+            pre_limit_width = image.shape[1]
+            scale = input_limit / pre_limit_width
+            new_height = max(1, int(round(image.shape[0] * scale)))
+            image = np.array(
+                PIL.Image.fromarray(image).resize(
+                    (input_limit, new_height),
+                    PIL.Image.Resampling.LANCZOS
+                )
+            )
+            progress_queue.put({'type': 'log', 'message': f"[*] Limiting input width: {pre_limit_width}px -> {input_limit}px"})
+
         if config.denoise and denoiser:
             progress_queue.put({'type': 'log', 'message': "[*] Denoising..."})
             image = denoiser.denoise(image, config.denoise_sigma)
 
         if config.colorize and colorizer:
             progress_queue.put({'type': 'log', 'message': "[*] Colorizing..."})
+            luminance_source = image.copy()
 
             # This logic ensures the image width sent to the colorizer is a multiple of 32.
             original_width = image.shape[1]
             target_width = config.colorized_image_size
+            if getattr(config, 'force_safe_colorizer_width', False):
+                target_width = 576
 
             # Use the smaller of the original width or the user-defined target width.
             effective_width = min(original_width, target_width)
@@ -88,7 +139,8 @@ def process_image(image_path, output_folder, colorizer, upscaler, denoiser, conf
             # Set the image for the colorizer with the new, safe width.
             colorizer.set_image((image.astype('float32') / 255), adjusted_width)
 
-            image = colorizer.colorize()
+            colorized_output = colorizer.colorize()
+            image = transfer_luminance_from_source(luminance_source, colorized_output)
 
         if config.upscale and upscaler:
             progress_queue.put({'type': 'log', 'message': f"[*] Upscaling by {config.upscale_factor}x..."})
@@ -116,6 +168,12 @@ class ColorizerApp(tk.Tk):
         self.config = config
         self.settings_file = "settings.json"
 
+        if not hasattr(self.config, 'force_safe_colorizer_width'):
+            self.config.force_safe_colorizer_width = True
+        if not hasattr(self.config, 'input_image_size'):
+            self.config.input_image_size = 800
+        self.config.input_image_size = min(self.config.input_image_size, MAX_INPUT_WIDTH)
+
         self.title("Manga Colorizer")
         self.geometry("550x700")
 
@@ -138,6 +196,8 @@ class ColorizerApp(tk.Tk):
         self.colorizer_tile_size = tk.IntVar(value=0)
         self.tile_pad = tk.IntVar(value=8)
         self.colorized_image_size = tk.IntVar(value=576)
+        self.input_image_size = tk.IntVar(value=min(getattr(self.config, 'input_image_size', 800), MAX_INPUT_WIDTH))
+        self.force_safe_colorizer_width = tk.BooleanVar(value=self.config.force_safe_colorizer_width)
 
 
         self.processing_thread = None
@@ -317,6 +377,22 @@ class ColorizerApp(tk.Tk):
                 original_image_pil = PIL.Image.open(image_path).convert("RGB")
                 image_np = np.array(original_image_pil)
 
+                requested_limit = getattr(self.config, 'input_image_size', 0)
+                input_limit = min(requested_limit, MAX_INPUT_WIDTH) if requested_limit else 0
+                if requested_limit and requested_limit > MAX_INPUT_WIDTH:
+                    self.log(f"[*] Input clamp capped at {MAX_INPUT_WIDTH}px for preview (requested {requested_limit}px).")
+
+                if input_limit and image_np.shape[1] > input_limit:
+                    scale = input_limit / image_np.shape[1]
+                    new_height = max(1, int(round(image_np.shape[0] * scale)))
+                    image_np = np.array(
+                        PIL.Image.fromarray(image_np).resize(
+                            (input_limit, new_height),
+                            PIL.Image.Resampling.LANCZOS
+                        )
+                    )
+                    self.log(f"[*] Limiting preview input width: {original_image_pil.width}px -> {input_limit}px")
+
                 # Denoise step
                 if self.config.denoise and denoiser:
                     self.after(0, lambda: colorized_label.config(text="Denoising..."))
@@ -324,7 +400,11 @@ class ColorizerApp(tk.Tk):
 
                 self.after(0, lambda: colorized_label.config(text="Colorizing..."))
 
+                luminance_source = image_np.copy()
+
                 target_width = self.config.colorized_image_size
+                if getattr(self.config, 'force_safe_colorizer_width', False):
+                    target_width = 576
                 original_width = image_np.shape[1]
                 effective_width = min(original_width, target_width)
                 adjusted_width = effective_width - (effective_width % 32)
@@ -332,6 +412,7 @@ class ColorizerApp(tk.Tk):
 
                 colorizer.set_image((image_np.astype('float32') / 255), adjusted_width)
                 colorized_image_np = colorizer.colorize()
+                colorized_image_np = transfer_luminance_from_source(luminance_source, colorized_image_np)
                 colorized_image_pil = PIL.Image.fromarray(colorized_image_np)
 
                 max_size = (512, 768)
@@ -374,10 +455,44 @@ class ColorizerApp(tk.Tk):
         adv_window.transient(self)
         adv_window.grab_set()
 
-        main_frame = ttk.Frame(adv_window, padding="10")
+        main_frame = ttk.Frame(adv_window)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        paths_frame = ttk.LabelFrame(main_frame, text="Model Paths", padding="10")
+        canvas = tk.Canvas(main_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas, padding="10")
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _on_mousewheel(event):
+            if event.delta:
+                canvas.yview_scroll(int(-event.delta / 120), "units")
+            elif event.num == 4:
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                canvas.yview_scroll(1, "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", _on_mousewheel)
+        canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _cleanup_scroll(_):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        adv_window.bind("<Destroy>", _cleanup_scroll)
+
+        paths_frame = ttk.LabelFrame(scrollable_frame, text="Model Paths", padding="10")
         paths_frame.pack(fill=tk.X, pady=5)
         paths_frame.columnconfigure(1, weight=1)
         ttk.Label(paths_frame, text="Colorizer:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
@@ -387,7 +502,7 @@ class ColorizerApp(tk.Tk):
         ttk.Entry(paths_frame, textvariable=self.upscaler_path).grid(row=1, column=1, sticky="ew", padx=5, pady=2)
         ttk.Button(paths_frame, text="...", command=lambda: self.select_model_path(self.upscaler_path)).grid(row=1, column=2, padx=5, pady=2)
 
-        perf_frame = ttk.LabelFrame(main_frame, text="Performance", padding="10")
+        perf_frame = ttk.LabelFrame(scrollable_frame, text="Performance", padding="10")
         perf_frame.pack(fill=tk.X, pady=5)
 
         def create_slider(parent, text, variable, from_, to, desc):
@@ -411,19 +526,29 @@ class ColorizerApp(tk.Tk):
                       "Size of tiles for colorizing. Usually not needed. 0 disables tiling. Default: 0").pack(fill=tk.X)
         create_slider(perf_frame, "Tile Padding", self.tile_pad, 0, 64,
                       "Pixel overlap between tiles to reduce seams. Default: 8").pack(fill=tk.X)
+        create_slider(perf_frame, "Input Image Size", self.input_image_size, 256, MAX_INPUT_WIDTH,
+                      f"Maximum width (px) to downscale pages before colorization (capped at {MAX_INPUT_WIDTH}). Higher uses more VRAM. Default: 800").pack(fill=tk.X)
         create_slider(perf_frame, "Colorized Image Size", self.colorized_image_size, 256, 1184,
                       "Target width for the colorizer. Larger isn't always better, but can help with blurry text. Default: 576").pack(fill=tk.X)
 
-        upscaler_frame = ttk.LabelFrame(main_frame, text="Upscaler Type", padding="10")
+        reliability_frame = ttk.LabelFrame(scrollable_frame, text="Colorizer Reliability", padding="10")
+        reliability_frame.pack(fill=tk.X, pady=5)
+        ttk.Checkbutton(
+            reliability_frame,
+            text="Lock colorizer internal width to 576px (recommended)",
+            variable=self.force_safe_colorizer_width
+        ).pack(anchor="w")
+
+        upscaler_frame = ttk.LabelFrame(scrollable_frame, text="Upscaler Type", padding="10")
         upscaler_frame.pack(fill=tk.X, pady=5)
         upscaler_combo = ttk.Combobox(upscaler_frame, textvariable=self.upscaler_type, values=['ESRGAN', 'GigaGAN'], state="readonly")
         upscaler_combo.pack(fill=tk.X)
 
-        denoise_frame = ttk.LabelFrame(main_frame, text="Denoise Sigma", padding="10")
+        denoise_frame = ttk.LabelFrame(scrollable_frame, text="Denoise Sigma", padding="10")
         denoise_frame.pack(fill=tk.X, pady=5)
         create_slider(denoise_frame, "Value", self.denoise_sigma, 1, 100, "Strength of the denoiser. Default: 25").pack(fill=tk.X)
 
-        ttk.Button(main_frame, text="Close", command=adv_window.destroy).pack(side=tk.BOTTOM, pady=10)
+        ttk.Button(scrollable_frame, text="Close", command=adv_window.destroy).pack(side=tk.BOTTOM, pady=10)
 
     def open_bug_report_link(self, event):
         """Opens the GitHub issues page in a new browser tab."""
@@ -487,6 +612,8 @@ class ColorizerApp(tk.Tk):
         self.config.colorizer_tile_size = self.colorizer_tile_size.get()
         self.config.tile_pad = self.tile_pad.get()
         self.config.colorized_image_size = self.colorized_image_size.get()
+        self.config.input_image_size = self.input_image_size.get()
+        self.config.force_safe_colorizer_width = self.force_safe_colorizer_width.get()
 
     def _get_and_manage_models(self):
         """
@@ -693,7 +820,9 @@ class ColorizerApp(tk.Tk):
             "upscaler_tile_size": self.upscaler_tile_size.get(),
             "colorizer_tile_size": self.colorizer_tile_size.get(),
             "tile_pad": self.tile_pad.get(),
-            "colorized_image_size": self.colorized_image_size.get()
+            "colorized_image_size": self.colorized_image_size.get(),
+            "input_image_size": min(self.input_image_size.get(), MAX_INPUT_WIDTH),
+            "force_safe_colorizer_width": self.force_safe_colorizer_width.get()
         }
         try:
             with open(self.settings_file, 'w') as f:
@@ -723,6 +852,9 @@ class ColorizerApp(tk.Tk):
                     self.colorizer_tile_size.set(settings.get("colorizer_tile_size", 0))
                     self.tile_pad.set(settings.get("tile_pad", 8))
                     self.colorized_image_size.set(settings.get("colorized_image_size", 576))
+                    loaded_input_size = settings.get("input_image_size", 800)
+                    self.input_image_size.set(min(loaded_input_size, MAX_INPUT_WIDTH))
+                    self.force_safe_colorizer_width.set(settings.get("force_safe_colorizer_width", True))
 
         except Exception as e:
             self.log(f"[!] Could not load settings: {e}")
@@ -762,6 +894,8 @@ if __name__ == "__main__":
     config.tile_pad = 8
     config.colorized_image_size = 576
     config.upscale_factor = 4 # This is not currently user-configurable
+    config.input_image_size = min(800, MAX_INPUT_WIDTH)
+    config.force_safe_colorizer_width = True
 
     app = ColorizerApp(config)
     app.mainloop()
