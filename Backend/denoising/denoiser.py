@@ -24,11 +24,12 @@ from .models import FFDNet
 from .utils import normalize, variable_to_cv2_image, remove_dataparallel_wrapper, is_rgb
     
 class FFDNetDenoiser:
-    def __init__(self, _device, _sigma = 25, _weights_dir = 'denoising/models/', _in_ch = 3):
+    def __init__(self, _device, _sigma = 25, _weights_dir = 'denoising/models/', _in_ch = 3, max_side=None):
         self.sigma = _sigma / 255
         self.weights_dir = _weights_dir
         self.channels = _in_ch
         self.device = _device
+        self.max_side = max_side
         
         self.model = FFDNet(num_input_channels = _in_ch)
         self.load_weights()
@@ -60,9 +61,16 @@ class FFDNetDenoiser:
             
         imorig = imorig[..., :3]
 
-        if (max(imorig.shape[0], imorig.shape[1]) > 1200):
-            ratio = max(imorig.shape[0], imorig.shape[1]) / 1200
-            imorig = cv2.resize(imorig, (int(imorig.shape[1] / ratio), int(imorig.shape[0] / ratio)), interpolation = cv2.INTER_AREA)
+        original_shape = imorig.shape[:2]
+        resized_for_limit = False
+        if self.max_side and max(imorig.shape[0], imorig.shape[1]) > self.max_side:
+            ratio = max(imorig.shape[0], imorig.shape[1]) / self.max_side
+            imorig = cv2.resize(
+                imorig,
+                (int(imorig.shape[1] / ratio), int(imorig.shape[0] / ratio)),
+                interpolation=cv2.INTER_AREA
+            )
+            resized_for_limit = True
 
         imorig = imorig.transpose(2, 0, 1)
  
@@ -114,4 +122,9 @@ class FFDNetDenoiser:
             outim = outim[:, :, :, :-1]
             imnoisy = imnoisy[:, :, :, :-1]
         
-        return variable_to_cv2_image(outim)
+        result = variable_to_cv2_image(outim)
+
+        if resized_for_limit and result.shape[:2] != original_shape:
+            result = cv2.resize(result, (original_shape[1], original_shape[0]), interpolation=cv2.INTER_CUBIC)
+
+        return result
