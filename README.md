@@ -1,4 +1,4 @@
-# Manga Colorizer (Standalone GUI Fork)
+# Manga Colorizer (Standalone GUI Fork of Fork)
 
 This project provides a standalone desktop application with a graphical user interface (GUI) for the [Manga-Colorizer](https://github.com/BinitDOX/Manga-Colorizer). It functions as a UI wrapper, removing the original client/server architecture that required running a backend server and a browser-based front end (like Firefox, Safari, or Chrome).
 
@@ -10,8 +10,10 @@ Unlike the original version which colorized images directly on websites, this ap
 **TL;DR**
 - **Original:** Runs a server + uses your web browser as a plugin to process pages.  
 - **This fork:** Runs as a desktop app — no browser, no separate server.  
-- **Original:** Processes web pages individually.  
-- **This fork:** Can process entire folders at once.  
+- **Original:** Processes web pages individually.
+- ~~**This fork:** Can process entire folders at once.~~
+-  **This fork of the fork:** Can process entire directorys with subdirs at once
+-  **This fork of the fork:** Has fixed the Colorize hue shift by seperating Colorize input res from input res(for denoise/upscale) then merge them
 
 ---
 
