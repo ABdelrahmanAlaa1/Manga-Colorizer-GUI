@@ -31,7 +31,7 @@ from utils.utils import distance_from_grayscale, save_image, clear_torch_cache
 
 
 # --- Core Processing Logic ---
-def process_image(image_path, output_folder, colorizer, upscaler, denoiser, config, progress_queue, overwrite_existing):
+def process_image(image_path, output_folder, colorizer, upscaler, denoiser, config, progress_queue, overwrite_existing, relative_subdir=""):
     """
     Processes a single image: denoises, colorizes, and upscales based on the config.
     Sends progress updates back to the GUI via a queue.
@@ -39,7 +39,9 @@ def process_image(image_path, output_folder, colorizer, upscaler, denoiser, conf
     """
     try:
         image_name = os.path.basename(image_path)
-        output_path = os.path.join(output_folder, image_name)
+        output_dir = os.path.join(output_folder, relative_subdir) if relative_subdir else output_folder
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, image_name)
 
         if not overwrite_existing and os.path.exists(output_path):
             progress_queue.put({'type': 'log', 'message': f"[~] Skipping '{image_name}' as it already exists."})
@@ -255,7 +257,13 @@ class ColorizerApp(tk.Tk):
             return
 
         supported_ext = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
-        image_paths = [os.path.join(image_folder, f) for f in os.listdir(image_folder) if f.lower().endswith(supported_ext)]
+        image_paths = []
+        for root, _, files in os.walk(image_folder):
+            for filename in files:
+                if filename.lower().endswith(supported_ext):
+                    image_paths.append(os.path.join(root, filename))
+
+        image_paths.sort()
 
         if not image_paths:
             self.log(f"[!] No images found in '{os.path.basename(image_folder)}' for preview.")
@@ -352,7 +360,8 @@ class ColorizerApp(tk.Tk):
         # --- 5. Define the button command ---
         def start_new_pick():
             new_path = random.choice(image_paths)
-            self.log(f"[*] Previewing random image: {os.path.basename(new_path)}")
+            rel_log_name = os.path.relpath(new_path, image_folder)
+            self.log(f"[*] Previewing random image: {rel_log_name}")
             threading.Thread(target=lambda: load_and_colorize_image(new_path), daemon=True).start()
 
         repick_button.config(command=start_new_pick)
@@ -588,7 +597,17 @@ class ColorizerApp(tk.Tk):
         os.chdir(backend_path) # Change directory for the duration of the thread
 
         supported_formats = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
-        images_to_process = sorted([f for f in os.listdir(input_path) if f.lower().endswith(supported_formats)])
+        images_to_process = []
+
+        for root, _, files in os.walk(input_path):
+            for filename in files:
+                if filename.lower().endswith(supported_formats):
+                    rel_dir = os.path.relpath(root, input_path)
+                    if rel_dir == '.':
+                        rel_dir = ''
+                    images_to_process.append((os.path.join(root, filename), rel_dir))
+
+        images_to_process.sort(key=lambda item: item[0])
         total_images = len(images_to_process)
 
         if not images_to_process:
@@ -601,7 +620,7 @@ class ColorizerApp(tk.Tk):
 
         recent_times = deque(maxlen=10)
 
-        for i, image_file in enumerate(images_to_process):
+        for i, (full_image_path, rel_dir) in enumerate(images_to_process):
             if self.terminate_event.is_set():
                 break
 
@@ -624,9 +643,8 @@ class ColorizerApp(tk.Tk):
             if self.config.denoise and denoiser is None: continue
 
             overwrite = self.overwrite_existing.get()
-            full_image_path = os.path.join(input_path, image_file)
 
-            duration = process_image(full_image_path, output_path, colorizer, upscaler, denoiser, self.config, self.progress_queue, overwrite)
+            duration = process_image(full_image_path, output_path, colorizer, upscaler, denoiser, self.config, self.progress_queue, overwrite, rel_dir)
 
             if duration > 0:
                 recent_times.append(duration)
