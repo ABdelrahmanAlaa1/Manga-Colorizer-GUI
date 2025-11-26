@@ -65,7 +65,7 @@ pip install Flask Flask_Cors matplotlib numpy opencv_python_headless scikit_imag
   ```
 - **Windows/Linux with NVIDIA GPU (CUDA):**
   ```bash
-  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
   ```
 - **Windows/Linux without a dedicated GPU:**
   ```bash
