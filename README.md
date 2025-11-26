@@ -32,7 +32,7 @@ Or download as a ZIP and extract it.
 
 ---
 
-### 2️⃣ Set Up the Conda Environment
+### 2️⃣ Set Up the Conda Environment (optional)
 
 We recommend **Conda** to manage dependencies.
 
