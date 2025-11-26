@@ -11,7 +11,11 @@ class MangaDenoiser:
         else:
             self.device = config.device
 
-        self.model = FFDNetDenoiser(self.device)
+        max_denoise_side = getattr(config, 'denoise_max_side', None)
+        if max_denoise_side in (0, None):
+            max_denoise_side = None
+        self.model = FFDNetDenoiser(self.device, max_side=max_denoise_side)
+
 
 
     def denoise(self, image, sigma=25):
