@@ -467,7 +467,10 @@ class ColorizerApp(tk.Tk):
             lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        scrollable_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        def _sync_frame_width(event):
+            canvas.itemconfig(scrollable_window, width=event.width)
+        canvas.bind("<Configure>", _sync_frame_width)
         canvas.configure(yscrollcommand=scrollbar.set)
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -518,6 +521,12 @@ class ColorizerApp(tk.Tk):
             slider.pack(fill=tk.X, pady=(2,0))
             desc_label = ttk.Label(frame, text=desc, wraplength=450, justify="left", style="Italic.TLabel")
             desc_label.pack(anchor="w", pady=(0, 10))
+
+            def update_wrap(event, lbl=desc_label):
+                wrap = max(200, event.width - 20)
+                lbl.config(wraplength=wrap)
+
+            frame.bind("<Configure>", update_wrap)
             return frame
 
         create_slider(perf_frame, "Upscaler Tile Size", self.upscaler_tile_size, 0, 1024,
