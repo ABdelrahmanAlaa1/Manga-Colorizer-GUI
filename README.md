@@ -14,6 +14,33 @@ Unlike the original version which colorized images directly on websites, this ap
 - ~~**This fork:** Can process entire folders at once.~~
 -  **This fork of the fork:** Can process entire directorys with subdirs at once
 -  **This fork of the fork:** Has fixed the Colorize hue shift by seperating Colorize input res from input res(for denoise/upscale) then merge them
+-  **This fork of the fork:** Uses compact folder-level progress logs by default (for example: `Processing: c101 [13/22] (59%)`)
+-  **This fork of the fork:** Keeps per-image step logs available via Advanced Settings -> Logging -> `Enable detailed per-image debug logs`
+-  **This fork of the fork:** Adds controlled preview navigation (`Prev`, `Next`, `Random`, `Re-run Current`) with deterministic image index tracking
+-  **This fork of the fork:** Adds live preview tuning for denoise sigma and color-transfer quality controls with debounced reruns on the same page
+-  **This fork of the fork:** Adds named quality presets with global defaults, per-folder overrides, and JSON import/export
+-  **This fork of the fork:** Extracts transfer/mask logic into `Backend/transfer_quality.py` for easier maintenance
+
+### Preview Tuning Workflow
+
+- Open `Preview` from the main window to launch side-by-side original vs colorized rendering.
+- Both preview images are now scrollable (horizontal + vertical) so full pages can be inspected without forced thumbnail cropping.
+- Scroll position is synchronized between Original and Colorized panes for easier A/B comparison.
+- Navigate with `Prev`, `Next`, or `Random`; use `Re-run Current` to force refresh on the same page.
+- Use `Zoom` to scale both panels while keeping scroll access for detail inspection.
+- Zoom supports typed percentages (for example `130`), `Fit Width`, `Fit Height`, `Ctrl +`, `Ctrl -`, and `Ctrl + mouse wheel`.
+- Live tuning is compact and collapsible (`Show Live Tuning`) with hover tooltips for parameter details.
+- Debug masks are available in Preview (`Edge`, `Line Ink`, `Screentone`) with `Overlay` and `Mask only` modes so detection regions can be inspected and tuned.
+- Use `Actions -> Export current original + masks...` to save a bundle containing source image, working image, previewed colorized image, full-strength raw masks, overlays, and metadata for offline review.
+- Preset management in preview is under a single `Actions` dropdown:
+  - New preset from current values
+  - Save to selected preset
+  - Rename/delete preset
+  - Set active preset (folder/global)
+  - Revert folder to `Default`
+  - Import/export presets as JSON
+
+Preset data is stored in `settings.json` under `presets.items`, with `active_global` and `folder_overrides` for scope selection. PR1.7 uses `line_ink_protection` keys (legacy `ink_protection` imports are still accepted).
 
 ---
 

@@ -8,3 +8,6 @@ settings.json
 Backend/.DS_Store
 Backend/networks/generator.zip
 .DS_Store
+
+# Knowledge Database
+manga_colorizer_knowledge.db

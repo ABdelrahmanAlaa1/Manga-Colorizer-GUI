@@ -1,0 +1,3246 @@
+import copy
+import ctypes
+import gc
+import math
+import os
+import re
+import queue
+import threading
+import time
+from collections import OrderedDict
+from contextlib import contextmanager
+
+import numpy as np
+import PIL.Image
+import torch
+
+from transfer_quality import transfer_luminance_from_source
+from utils.utils import clear_torch_cache, distance_from_grayscale, save_image
+
+
+VRAM_PER_DENOISER_MB = 25
+VRAM_PER_COLORIZER_MB = 325
+VRAM_PER_UPSCALER_MB = 650
+VRAM_OVERHEAD_MB = 2048
+
+INSTANCE_CAPS = {
+    'denoise': 32,
+    'colorize': 16,
+    'upscale': 8,
+}
+
+THREADS_PER_INSTANCE = {
+    'denoise': 3,
+    'colorize': 3,
+    'upscale': 3,
+}
+
+PIPELINE_PROFILE_VALUES = {
+    'Safe': {'denoise_inst': 2, 'colorize_inst': 1, 'upscale_inst': 1},
+    'Balanced': {'denoise_inst': 4, 'colorize_inst': 2, 'upscale_inst': 1},
+    'Performance': {'denoise_inst': 8, 'colorize_inst': 4, 'upscale_inst': 2},
+    'Aggressive': {'denoise_inst': 16, 'colorize_inst': 8, 'upscale_inst': 2},
+}
+
+MAX_INPUT_WIDTH = 1792
+MIN_INPUT_WIDTH = 256
+DEFAULT_INPUT_WIDTH = 800
+QUEUE_MEMORY_BUDGET_MB_DEFAULT = 384
+QUEUE_MEMORY_BUDGET_MB_MIN = 128
+QUEUE_MEMORY_BUDGET_MB_MAX = 1536
+QUEUE_MEMORY_BUDGET_AUTO_FRACTION = 0.18
+QUEUE_MEMORY_BUDGET_AUTO_HEADROOM_MB = 1024
+QUEUE_HARD_SAFETY_CAP = 48
+QUEUE_MAX_ITEMS_CAP = QUEUE_HARD_SAFETY_CAP
+QUEUE_MIN_ITEMS = 1
+QUEUE_RAM_HEADROOM_MB = 2048
+QUEUE_RAM_PRESSURE_WARN_MB = 1024
+QUEUE_DIAG_WAIT_WARN_S = 2.0
+QUEUE_DIAG_WAIT_REPORT_INTERVAL_S = 5.0
+QUEUE_DIAG_JOIN_REPORT_INTERVAL_S = 10.0
+QUEUE_DIAG_HEARTBEAT_INTERVAL_S = 10.0
+QUEUE_DIAG_WRITER_REPORT_INTERVAL_S = 10.0
+QUEUE_DIAG_JOIN_ABORT_ON_STOP_S = 5.0
+QUEUE_DIAG_SLOW_STAGE_S = 2.0
+
+
+class LogLevel:
+    ERROR = 'E'
+    WARNING = 'W'
+    DEBUG = 'D'
+    TRACE = 'T'
+    VERBOSE = 'V'
+
+
+def _bytes_to_mb(value):
+    return int(value // (1024 * 1024))
+
+
+def _queue_qsize(q):
+    try:
+        return int(q.qsize())
+    except Exception:
+        return -1
+
+
+def _queue_maxsize(q):
+    try:
+        return int(getattr(q, 'maxsize', 0) or 0)
+    except Exception:
+        return 0
+
+
+def _queue_state_text(q):
+    size = _queue_qsize(q)
+    cap = _queue_maxsize(q)
+    if size < 0:
+        return '?'
+    if cap > 0:
+        return f'{size}/{cap}'
+    return str(size)
+
+
+def get_default_instance_vram_profile_mb():
+    return {
+        'denoise': VRAM_PER_DENOISER_MB,
+        'colorize': VRAM_PER_COLORIZER_MB,
+        'upscale': VRAM_PER_UPSCALER_MB,
+    }
+
+
+def _normalized_instance_profile_mb(instance_profile_mb=None):
+    profile = get_default_instance_vram_profile_mb()
+    if isinstance(instance_profile_mb, dict):
+        for stage in ('denoise', 'colorize', 'upscale'):
+            if stage in instance_profile_mb:
+                try:
+                    profile[stage] = max(1, int(instance_profile_mb[stage]))
+                except (TypeError, ValueError):
+                    continue
+    return profile
+
+
+def estimate_vram_breakdown_mb(denoise_inst, colorize_inst, upscale_inst, instance_profile_mb=None, overhead_mb=0):
+    profile = _normalized_instance_profile_mb(instance_profile_mb)
+
+    pass1_stage_mb = (
+        int(denoise_inst) * profile['denoise']
+        + int(colorize_inst) * profile['colorize']
+    )
+    pass2_stage_mb = int(upscale_inst) * profile['upscale']
+
+    overhead = max(0, int(overhead_mb))
+    pass1_total_mb = pass1_stage_mb + overhead if pass1_stage_mb > 0 else 0
+    pass2_total_mb = pass2_stage_mb + overhead if pass2_stage_mb > 0 else 0
+
+    if pass1_total_mb <= 0 and pass2_total_mb <= 0:
+        peak_pass = 'none'
+        peak_total_mb = 0
+    elif pass1_total_mb >= pass2_total_mb:
+        peak_pass = 'pass1'
+        peak_total_mb = pass1_total_mb
+    else:
+        peak_pass = 'pass2'
+        peak_total_mb = pass2_total_mb
+
+    return {
+        'pass1_stage_mb': int(pass1_stage_mb),
+        'pass2_stage_mb': int(pass2_stage_mb),
+        'pass1_total_mb': int(pass1_total_mb),
+        'pass2_total_mb': int(pass2_total_mb),
+        'peak_pass': peak_pass,
+        'peak_total_mb': int(peak_total_mb),
+    }
+
+
+def estimate_vram_mb(denoise_inst, colorize_inst, upscale_inst, instance_profile_mb=None, overhead_mb=0):
+    breakdown = estimate_vram_breakdown_mb(
+        denoise_inst,
+        colorize_inst,
+        upscale_inst,
+        instance_profile_mb=instance_profile_mb,
+        overhead_mb=overhead_mb,
+    )
+    return int(breakdown['peak_total_mb'])
+
+
+def get_cuda_memory_stats_mb(device_index=0):
+    try:
+        if not torch.cuda.is_available():
+            return {}
+
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+        except TypeError:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+        try:
+            allocated_bytes = torch.cuda.memory_allocated(device_index)
+            reserved_bytes = torch.cuda.memory_reserved(device_index)
+        except TypeError:
+            allocated_bytes = torch.cuda.memory_allocated()
+            reserved_bytes = torch.cuda.memory_reserved()
+
+        total_mb = _bytes_to_mb(total_bytes)
+        free_mb = _bytes_to_mb(free_bytes)
+        process_allocated_mb = _bytes_to_mb(allocated_bytes)
+        process_reserved_mb = _bytes_to_mb(reserved_bytes)
+
+        return {
+            'device_index': int(device_index),
+            'total_mb': total_mb,
+            'free_mb': free_mb,
+            'used_mb': max(0, total_mb - free_mb),
+            'process_allocated_mb': process_allocated_mb,
+            'process_reserved_mb': process_reserved_mb,
+            'available_for_process_mb': max(0, free_mb + process_reserved_mb),
+        }
+    except Exception:
+        return {}
+
+
+def get_gpu_vram_mb():
+    stats = get_cuda_memory_stats_mb()
+    if stats:
+        return int(stats.get('total_mb', 0))
+    return 0
+
+
+def get_system_memory_stats_mb():
+    try:
+        if os.name == 'nt':
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ('dwLength', ctypes.c_ulong),
+                    ('dwMemoryLoad', ctypes.c_ulong),
+                    ('ullTotalPhys', ctypes.c_ulonglong),
+                    ('ullAvailPhys', ctypes.c_ulonglong),
+                    ('ullTotalPageFile', ctypes.c_ulonglong),
+                    ('ullAvailPageFile', ctypes.c_ulonglong),
+                    ('ullTotalVirtual', ctypes.c_ulonglong),
+                    ('ullAvailVirtual', ctypes.c_ulonglong),
+                    ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+                ]
+
+            memory_status = MEMORYSTATUSEX()
+            memory_status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(memory_status)):
+                return {}
+
+            total_mb = _bytes_to_mb(memory_status.ullTotalPhys)
+            available_mb = _bytes_to_mb(memory_status.ullAvailPhys)
+            return {
+                'total_mb': int(total_mb),
+                'available_mb': int(available_mb),
+                'used_mb': int(max(0, total_mb - available_mb)),
+            }
+
+        if hasattr(os, 'sysconf'):
+            page_size = int(os.sysconf('SC_PAGE_SIZE'))
+            total_pages = int(os.sysconf('SC_PHYS_PAGES'))
+            available_pages = int(os.sysconf('SC_AVPHYS_PAGES'))
+            total_mb = _bytes_to_mb(page_size * total_pages)
+            available_mb = _bytes_to_mb(page_size * available_pages)
+            return {
+                'total_mb': int(total_mb),
+                'available_mb': int(available_mb),
+                'used_mb': int(max(0, total_mb - available_mb)),
+            }
+    except Exception:
+        return {}
+
+    return {}
+
+
+def vram_warning_text(denoise_inst, colorize_inst, upscale_inst, instance_profile_mb=None, overhead_mb=0):
+    breakdown = estimate_vram_breakdown_mb(
+        denoise_inst,
+        colorize_inst,
+        upscale_inst,
+        instance_profile_mb=instance_profile_mb,
+        overhead_mb=overhead_mb,
+    )
+    est = int(breakdown['peak_total_mb'])
+    pass1_total_mb = int(breakdown['pass1_total_mb'])
+    pass2_total_mb = int(breakdown['pass2_total_mb'])
+
+    denoise_active = int(denoise_inst) > 0
+    colorize_active = int(colorize_inst) > 0
+    upscale_active = int(upscale_inst) > 0
+
+    pass1_short_parts = []
+    pass1_long_parts = []
+    if denoise_active:
+        pass1_short_parts.append('D')
+        pass1_long_parts.append('Denoise')
+    if colorize_active:
+        pass1_short_parts.append('C')
+        pass1_long_parts.append('Colorize')
+
+    if pass1_long_parts:
+        pass1_peak_label = f"Pass 1 ({' + '.join(pass1_long_parts)})"
+        pass1_breakdown_label = f"Pass1({'+'.join(pass1_short_parts)})"
+    else:
+        pass1_peak_label = 'Pass 1 (inactive)'
+        pass1_breakdown_label = 'Pass1(inactive)'
+
+    if upscale_active:
+        pass2_peak_label = 'Pass 2 (Upscale)'
+        pass2_breakdown_label = 'Pass2(U)'
+    else:
+        pass2_peak_label = 'Pass 2 (inactive)'
+        pass2_breakdown_label = 'Pass2(inactive)'
+
+    if est <= 0:
+        return ''
+
+    peak_pass = str(breakdown.get('peak_pass', 'none')).strip().lower()
+    peak_label = {
+        'pass1': pass1_peak_label,
+        'pass2': pass2_peak_label,
+    }.get(peak_pass, 'No active pass')
+
+    memory_stats = get_cuda_memory_stats_mb()
+    if memory_stats:
+        available = int(memory_stats.get('available_for_process_mb', 0))
+        gpu_vram = int(memory_stats.get('total_mb', 0))
+    else:
+        gpu_vram = get_gpu_vram_mb()
+        if gpu_vram == 0:
+            return ''
+        available = max(0, gpu_vram - VRAM_OVERHEAD_MB)
+
+    if est > available:
+        return (
+            f"Est. peak pipeline VRAM: ~{est} MB "
+            f"({peak_label}; {pass1_breakdown_label}={pass1_total_mb} MB, {pass2_breakdown_label}={pass2_total_mb} MB). "
+            f"(GPU has {gpu_vram} MB, ~{available} MB usable). Risk of OOM errors."
+        )
+
+    if est > available * 0.8:
+        return (
+            f"Pipeline peak VRAM: ~{est}/{available} MB available ({peak_label}; "
+            f"{pass1_breakdown_label}={pass1_total_mb} MB, {pass2_breakdown_label}={pass2_total_mb} MB) - near limit."
+        )
+
+    return ''
+
+
+def safe_put(q, item, stop_events, timeout=0.25, diag=None):
+    wait_started = time.monotonic()
+    last_wait_report = wait_started
+
+    while True:
+        for evt in stop_events:
+            if evt.is_set():
+                if isinstance(diag, dict):
+                    on_abort = diag.get('on_abort')
+                    if callable(on_abort):
+                        try:
+                            on_abort(
+                                wait_seconds=max(0.0, time.monotonic() - wait_started),
+                                queue_state=_queue_state_text(q),
+                            )
+                        except Exception:
+                            pass
+                return False
+
+        try:
+            q.put(item, timeout=timeout)
+
+            if isinstance(diag, dict):
+                on_success = diag.get('on_success')
+                if callable(on_success):
+                    try:
+                        on_success(
+                            wait_seconds=max(0.0, time.monotonic() - wait_started),
+                            queue_state=_queue_state_text(q),
+                        )
+                    except Exception:
+                        pass
+
+            return True
+        except queue.Full:
+            if isinstance(diag, dict) and bool(diag.get('enabled', False)):
+                now = time.monotonic()
+                elapsed = max(0.0, now - wait_started)
+                warn_after_s = float(diag.get('warn_after_s', QUEUE_DIAG_WAIT_WARN_S))
+                report_interval_s = float(diag.get('report_interval_s', QUEUE_DIAG_WAIT_REPORT_INTERVAL_S))
+
+                if elapsed >= warn_after_s and (now - last_wait_report) >= report_interval_s:
+                    on_wait = diag.get('on_wait')
+                    if callable(on_wait):
+                        try:
+                            on_wait(wait_seconds=elapsed, queue_state=_queue_state_text(q))
+                        except Exception:
+                            pass
+                    last_wait_report = now
+            continue
+
+
+def sanitize_input_width_limit(value, fallback=DEFAULT_INPUT_WIDTH):
+    try:
+        requested = int(value)
+    except (TypeError, ValueError):
+        requested = int(fallback)
+
+    if requested <= 0:
+        requested = int(fallback)
+
+    return max(MIN_INPUT_WIDTH, min(MAX_INPUT_WIDTH, requested))
+
+
+def clamp_image_to_input_width(image, input_limit):
+    limit = sanitize_input_width_limit(input_limit)
+    if image.shape[1] <= limit:
+        return image, False, image.shape[1], limit
+
+    original_width = image.shape[1]
+    scale = limit / original_width
+    resized_height = max(1, int(round(image.shape[0] * scale)))
+    resized_image = np.array(
+        PIL.Image.fromarray(image).resize(
+            (limit, resized_height),
+            PIL.Image.Resampling.LANCZOS,
+        )
+    )
+    return resized_image, True, original_width, limit
+
+
+def _natural_sort_key(filename):
+    """Natural sort key for fuzzy file matching.
+
+    Splits filename into alternating (text, number) parts so that:
+    - Text parts sort alphabetically (case-insensitive)
+    - Embedded numbers sort by numeric value (not lexicographic)
+    - Different prefixes from paused/resumed batch runs stay grouped correctly
+
+    Examples (sorted order):
+        '_testq_0001.png' < '_testq_0007.png' < 'testq_0001.png' < 'testq_0012.png'
+        '001.jpg' < '002.jpg' < '010.jpg'
+    """
+    stem = os.path.splitext(filename)[0]
+    parts = re.split(r'(\d+)', stem)
+    key = []
+    for part in parts:
+        if part.isdigit():
+            key.append(('', int(part)))
+        elif part:
+            key.append((part.lower(), 0))
+    return key
+
+
+def build_external_color_map(grouped_by_folder, external_dir, supported_formats=None, emit_fn=None):
+    """Build a mapping from (rel_dir, image_name) -> external_color_filepath.
+
+    Uses natural sort (alphanumeric) to order both file lists, then matches
+    them positionally (1st to 1st, 2nd to 2nd, etc.).
+
+    This handles paused/resumed ComfyUI runs where numbering resets across
+    different filename prefixes (e.g. '_testq_0001'...'_testq_0007' then
+    'testq_0001'...'testq_0012'). Natural sort keeps prefix groups together
+    and sequential within each group.
+    """
+    if not external_dir or not os.path.isdir(external_dir):
+        return {}, [f"External color source directory does not exist: {external_dir}"]
+
+    if supported_formats is None:
+        supported_formats = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
+
+    color_map = {}
+    warnings = []
+
+    for rel_dir, folder_images in grouped_by_folder.items():
+        # Try matching subdirectory first, then flat
+        ext_subdir = os.path.join(external_dir, rel_dir) if rel_dir else external_dir
+        if not os.path.isdir(ext_subdir):
+            ext_subdir = external_dir  # Fall back to flat directory
+
+        # Get external files in this directory
+        external_files = []
+        try:
+            for f in os.listdir(ext_subdir):
+                if f.lower().endswith(supported_formats):
+                    external_files.append(os.path.join(ext_subdir, f))
+        except OSError:
+            warnings.append(f"Cannot read external color directory: {ext_subdir}")
+            continue
+
+        if not external_files:
+            display_dir = rel_dir or '(root)'
+            warnings.append(f"No external color images found for folder '{display_dir}' in {ext_subdir}")
+            continue
+
+        # Sort both lists by natural sort key (handles prefix groups + numbers)
+        pipeline_names = [os.path.basename(fp) for fp, _ in folder_images]
+        pipeline_sorted = sorted(
+            enumerate(pipeline_names),
+            key=lambda x: _natural_sort_key(x[1]),
+        )
+
+        external_sorted = sorted(
+            external_files,
+            key=lambda x: _natural_sort_key(os.path.basename(x)),
+        )
+
+        # Match by position
+        match_count = min(len(pipeline_sorted), len(external_sorted))
+        for i in range(match_count):
+            _orig_idx, pipeline_name = pipeline_sorted[i]
+            external_path = external_sorted[i]
+            color_map[(rel_dir, pipeline_name)] = external_path
+
+        # Warn about unmatched files
+        display_dir = rel_dir or '(root)'
+        if len(pipeline_sorted) > len(external_sorted):
+            unmatched = len(pipeline_sorted) - len(external_sorted)
+            warnings.append(
+                f"Folder '{display_dir}': {unmatched} pipeline images have no matching external color source"
+            )
+        elif len(external_sorted) > len(pipeline_sorted):
+            extra = len(external_sorted) - len(pipeline_sorted)
+            warnings.append(
+                f"Folder '{display_dir}': {extra} extra external color images (unused)"
+            )
+
+    return color_map, warnings
+
+
+def calculate_max_instances_from_vram(
+    gpu_vram_mb,
+    stage,
+    other_stages_mb=0,
+    per_instance_mb=None,
+    overhead_mb=None,
+):
+    if gpu_vram_mb <= 0:
+        return 1
+
+    defaults = get_default_instance_vram_profile_mb()
+    inst_cost = int(per_instance_mb or defaults.get(stage, VRAM_PER_UPSCALER_MB))
+    overhead = int(overhead_mb if overhead_mb is not None else VRAM_OVERHEAD_MB)
+
+    available = int(gpu_vram_mb) - overhead - int(other_stages_mb)
+    if available <= 0:
+        return 1
+
+    safe_available = int(available * 0.85)
+    max_inst = max(1, safe_available // max(1, inst_cost))
+    return min(max_inst, int(INSTANCE_CAPS.get(stage, 4)))
+
+
+class _PipelineAborted(Exception):
+    pass
+
+
+class ModelInstancePool:
+    def __init__(self, model_factory, count, stage_name='stage'):
+        self.stage_name = stage_name
+        self.count = int(count)
+        self._pool = queue.Queue()
+        self.precision_summary = ''
+        for idx in range(self.count):
+            instance = model_factory()
+            if idx == 0:
+                summary = getattr(instance, 'precision_summary', None)
+                if callable(summary):
+                    summary = summary()
+                if isinstance(summary, str):
+                    self.precision_summary = summary
+            self._pool.put(instance)
+
+    @contextmanager
+    def checkout(self, stop_events=(), timeout=0.5):
+        instance = None
+        while instance is None:
+            for evt in stop_events:
+                if evt.is_set():
+                    raise _PipelineAborted(self.stage_name)
+            try:
+                instance = self._pool.get(timeout=timeout)
+            except queue.Empty:
+                continue
+
+        try:
+            yield instance
+        finally:
+            self._pool.put(instance)
+
+    def drain(self):
+        instances = []
+        while not self._pool.empty():
+            try:
+                instances.append(self._pool.get_nowait())
+            except queue.Empty:
+                break
+        return instances
+
+
+class ProcessingPipeline:
+    def __init__(
+        self,
+        config,
+        model_factories,
+        instance_counts,
+        progress_callback,
+        terminate_event,
+        pause_event,
+        warmup_spec=None,
+        fail_fast=True,
+    ):
+        self.config = config
+        self.model_factories = dict(model_factories or {})
+        self.warmup_spec = dict(warmup_spec or {})
+        self.instance_counts = {
+            'denoise': max(0, int(instance_counts.get('denoise', 0))),
+            'colorize': max(0, int(instance_counts.get('colorize', 0))),
+            'upscale': max(0, int(instance_counts.get('upscale', 0))),
+        }
+        self.terminate_event = terminate_event
+        self.pause_event = pause_event
+        self.fail_fast = bool(fail_fast)
+        self.progress_callback = progress_callback
+        try:
+            self.writer_threads = max(1, int(getattr(self.config, 'pipeline_writer_threads', 1) or 1))
+        except (TypeError, ValueError):
+            self.writer_threads = 1
+
+        self.pools = {}
+
+        self.instance_vram_observed_mb = {}
+        self.stage_peak_inference_mb = {}
+        self.runtime_overhead_observed_mb = 0
+        self.cuda_baseline_stats = get_cuda_memory_stats_mb()
+        self.cuda_after_pool_stats = {}
+        self.cuda_after_warmup_stats = {}
+        self.adaptive_upscale_limit = {
+            'applied': False,
+            'from_instances': 0,
+            'to_instances': 0,
+            'from_workers': 0,
+            'to_workers': 0,
+            'from': 0,
+            'to': 0,
+            'projected_peak_mb': 0,
+            'available_vram_mb': 0,
+            'burst_window_mb': 0,
+            'headroom_mb': 0,
+            'overhead_mb': 0,
+            'shared_peak_mb': 0,
+            'trigger': '',
+            'reason': '',
+        }
+
+        self._external_color_map = {}
+
+        self.worker_counts = {}
+        for stage in ('denoise', 'colorize', 'upscale'):
+            inst = int(self.instance_counts.get(stage, 0))
+            tpi = int(THREADS_PER_INSTANCE.get(stage, 1))
+            self.worker_counts[stage] = max(1, inst * tpi) if inst > 0 else 0
+
+    def get_shared_stage_peak_mb(self):
+        return {
+            stage: max(0, int(self.stage_peak_inference_mb.get(stage, 0) or 0))
+            for stage in ('denoise', 'colorize', 'upscale')
+        }
+
+    def _emit(self, payload, level=LogLevel.DEBUG):
+        try:
+            out_payload = payload
+            if isinstance(payload, dict):
+                out_payload = dict(payload)
+                if out_payload.get('type') in ('log', 'log_update') and 'level' not in out_payload:
+                    out_payload['level'] = str(level or LogLevel.DEBUG)
+            self.progress_callback(out_payload)
+        except Exception:
+            pass
+
+    def _stop_state_text(self, pass_stop_event=None):
+        pass_stop_set = bool(pass_stop_event.is_set()) if isinstance(pass_stop_event, threading.Event) else False
+        return f"terminate={int(self.terminate_event.is_set())}, pass_stop={int(pass_stop_set)}"
+
+    def _is_stop_requested(self, pass_stop_event=None):
+        pass_stop_set = bool(pass_stop_event.is_set()) if isinstance(pass_stop_event, threading.Event) else False
+        return bool(self.terminate_event.is_set() or pass_stop_set)
+
+    def _wait_while_paused(self, pass_stop_event=None, sleep_s=0.2):
+        wait_step = max(0.01, float(sleep_s))
+        while self.pause_event.is_set():
+            if self._is_stop_requested(pass_stop_event):
+                return False
+            time.sleep(wait_step)
+        return not self._is_stop_requested(pass_stop_event)
+
+    def _make_safe_put_diag(self, detailed_logs, pass_stop_event, owner, queue_name, item_ref=None):
+        if not detailed_logs:
+            return None
+
+        state_ref = item_ref if isinstance(item_ref, dict) else {}
+
+        def _item_label():
+            value = str(state_ref.get('item', '')).strip()
+            return value if value else '?'
+
+        def _on_wait(wait_seconds, queue_state):
+            self._emit(
+                {
+                    'type': 'log',
+                    'message': (
+                        '[*] Queue wait => '
+                        f'{owner}->{queue_name} '
+                        f'item:{_item_label()} '
+                        f'wait:{wait_seconds:.1f}s '
+                        f'q:{queue_state} '
+                        f'({self._stop_state_text(pass_stop_event)})'
+                    ),
+                },
+                level=LogLevel.DEBUG,
+            )
+
+        def _on_abort(wait_seconds, queue_state):
+            self._emit(
+                {
+                    'type': 'log',
+                    'message': (
+                        '[!] Queue enqueue aborted => '
+                        f'{owner}->{queue_name} '
+                        f'item:{_item_label()} '
+                        f'wait:{wait_seconds:.1f}s '
+                        f'q:{queue_state} '
+                        f'({self._stop_state_text(pass_stop_event)})'
+                    ),
+                },
+                level=LogLevel.WARNING,
+            )
+
+        def _on_success(wait_seconds, queue_state):
+            if wait_seconds < QUEUE_DIAG_WAIT_WARN_S:
+                return
+            self._emit(
+                {
+                    'type': 'log',
+                    'message': (
+                        '[*] Queue wait cleared => '
+                        f'{owner}->{queue_name} '
+                        f'item:{_item_label()} '
+                        f'wait:{wait_seconds:.1f}s '
+                        f'q:{queue_state}'
+                    ),
+                },
+                level=LogLevel.DEBUG,
+            )
+
+        return {
+            'enabled': True,
+            'warn_after_s': float(QUEUE_DIAG_WAIT_WARN_S),
+            'report_interval_s': float(QUEUE_DIAG_WAIT_REPORT_INTERVAL_S),
+            'on_wait': _on_wait,
+            'on_abort': _on_abort,
+            'on_success': _on_success,
+        }
+
+    @staticmethod
+    def _latency_summary_ms(samples):
+        values = [float(v) for v in (samples or []) if v is not None]
+        if not values:
+            return 0.0, 0.0, 0.0
+
+        values.sort()
+        count = len(values)
+        avg_ms = float(sum(values) / count)
+        p95_idx = max(0, min(count - 1, int(math.ceil(count * 0.95)) - 1))
+        p95_ms = float(values[p95_idx])
+        max_ms = float(values[-1])
+        return avg_ms, p95_ms, max_ms
+
+    def _emit_pass_state(self, state, message=''):
+        self._emit(
+            {
+                'type': 'pass_state',
+                'state': str(state),
+                'message': str(message or ''),
+            },
+            level=LogLevel.DEBUG,
+        )
+
+    def _emit_terminal(self, status, message=''):
+        self._emit(
+            {
+                'type': 'terminal',
+                'status': str(status),
+                'message': str(message or ''),
+            },
+            level=LogLevel.DEBUG,
+        )
+
+    def _get_warmup_input_hw(self):
+        warmup_hw = self.warmup_spec.get('input_hw') if isinstance(self.warmup_spec, dict) else None
+        if isinstance(warmup_hw, (list, tuple)) and len(warmup_hw) == 2:
+            try:
+                warmup_h = max(1, int(warmup_hw[0]))
+                warmup_w = max(1, int(warmup_hw[1]))
+                return warmup_h, warmup_w
+            except (TypeError, ValueError):
+                pass
+        return 1024, 576
+
+    def _apply_adaptive_upscale_worker_limit(self):
+        current_instances = int(self.instance_counts.get('upscale', 0))
+        current_workers = int(self.worker_counts.get('upscale', 0))
+        self.adaptive_upscale_limit = {
+            'applied': False,
+            'from_instances': current_instances,
+            'to_instances': current_instances,
+            'from_workers': current_workers,
+            'to_workers': current_workers,
+            'from': current_workers,
+            'to': current_workers,
+            'projected_peak_mb': 0,
+            'available_vram_mb': 0,
+            'burst_window_mb': 0,
+            'headroom_mb': 0,
+            'overhead_mb': 0,
+            'shared_peak_mb': 0,
+            'trigger': '',
+            'reason': '',
+        }
+
+        if 'upscale' not in self.pools or current_instances <= 0 or current_workers <= 0:
+            return
+
+        memory_stats = get_cuda_memory_stats_mb()
+        if not memory_stats:
+            self.adaptive_upscale_limit['reason'] = 'CUDA VRAM telemetry unavailable'
+            return
+
+        available_for_process = int(memory_stats.get('available_for_process_mb', 0) or 0)
+        if available_for_process <= 0:
+            available_for_process = int(memory_stats.get('free_mb', 0) or 0)
+        if available_for_process <= 0:
+            self.adaptive_upscale_limit['reason'] = 'CUDA VRAM telemetry unavailable'
+            return
+
+        profile = self.get_instance_vram_profile_mb()
+        per_instance_mb = max(1, int(profile.get('upscale', 0) or 0))
+        shared_stage_peak = self.get_shared_stage_peak_mb()
+        shared_upscale_peak_mb = int(shared_stage_peak.get('upscale', 0) or 0)
+
+        allocated_now = int(memory_stats.get('process_allocated_mb', 0) or 0)
+        inst_total_mb = 0
+        for stage in ('denoise', 'colorize', 'upscale'):
+            inst_total_mb += int(self.instance_counts.get(stage, 0)) * int(profile.get(stage, 0))
+        overhead_mb = max(0, int(allocated_now - inst_total_mb))
+        self.runtime_overhead_observed_mb = int(overhead_mb)
+
+        projected_breakdown = estimate_vram_breakdown_mb(
+            0,
+            0,
+            self.instance_counts.get('upscale', 0),
+            instance_profile_mb=profile,
+            overhead_mb=overhead_mb,
+        )
+        base_projected_mb = int(projected_breakdown.get('pass2_total_mb', 0) or 0)
+        projected_peak_mb = int(base_projected_mb + shared_upscale_peak_mb)
+
+        baseline_stats = self.cuda_baseline_stats or {}
+        after_pool_stats = self.cuda_after_pool_stats or {}
+        after_warmup_stats = self.cuda_after_warmup_stats or {}
+        baseline_reserved = int(baseline_stats.get('process_reserved_mb', 0) or 0)
+        after_pool_reserved = int(after_pool_stats.get('process_reserved_mb', baseline_reserved) or baseline_reserved)
+        after_warmup_reserved = int(after_warmup_stats.get('process_reserved_mb', after_pool_reserved) or after_pool_reserved)
+
+        reserved_growth_pool = max(0, after_pool_reserved - baseline_reserved)
+        reserved_growth_warmup = max(0, after_warmup_reserved - baseline_reserved)
+
+        cache_stats = after_warmup_stats or after_pool_stats or memory_stats or {}
+        cache_reserved = int(cache_stats.get('process_reserved_mb', 0) or 0)
+        cache_allocated = int(cache_stats.get('process_allocated_mb', 0) or 0)
+        cache_spread = max(0, cache_reserved - cache_allocated)
+
+        burst_window_mb = max(
+            reserved_growth_pool,
+            reserved_growth_warmup,
+            cache_spread,
+            shared_upscale_peak_mb,
+        )
+
+        headroom_mb = int(available_for_process - projected_peak_mb)
+        oversubscribed = projected_peak_mb > int(available_for_process * 0.95)
+        near_limit = projected_peak_mb > 0 and headroom_mb < int(burst_window_mb * 0.5)
+
+        trigger = ''
+        if oversubscribed:
+            trigger = 'oversubscription'
+        elif near_limit:
+            trigger = 'near-limit'
+
+        reason_parts = []
+        if oversubscribed:
+            reason_parts.append(
+                f'projected pass2 peak {projected_peak_mb} MB > available {available_for_process} MB'
+            )
+        if near_limit:
+            reason_parts.append(f'headroom {headroom_mb} MB < burst window {burst_window_mb} MB')
+
+        self.adaptive_upscale_limit.update(
+            {
+                'projected_peak_mb': int(projected_peak_mb),
+                'available_vram_mb': int(available_for_process),
+                'burst_window_mb': int(burst_window_mb),
+                'headroom_mb': int(headroom_mb),
+                'overhead_mb': int(overhead_mb),
+                'shared_peak_mb': int(shared_upscale_peak_mb),
+                'trigger': trigger,
+                'reason': '; '.join(reason_parts),
+            }
+        )
+
+        if not (oversubscribed or near_limit):
+            return
+
+        available_budget = max(0, int(available_for_process) - int(overhead_mb) - int(burst_window_mb))
+        target_instances = max(1, int(available_budget // max(1, per_instance_mb)))
+        target_instances = min(current_instances, target_instances)
+        target_instances = max(target_instances, current_instances - 1)
+        target_instances = max(1, int(target_instances))
+
+        target_workers = max(1, int(target_instances * int(THREADS_PER_INSTANCE.get('upscale', 1))))
+
+        if target_instances < current_instances:
+            self.instance_counts['upscale'] = int(target_instances)
+            self.worker_counts['upscale'] = int(target_workers)
+            self.adaptive_upscale_limit.update(
+                {
+                    'applied': True,
+                    'to_instances': int(target_instances),
+                    'to_workers': int(target_workers),
+                    'to': int(target_workers),
+                }
+            )
+
+            if 'upscale' in self.pools:
+                self._unload_pools(['upscale'])
+                self._create_pools(['upscale'])
+                self._run_stage_warmup_calibration()
+
+            refreshed_stats = get_cuda_memory_stats_mb()
+            if refreshed_stats:
+                refreshed_profile = self.get_instance_vram_profile_mb()
+                refreshed_allocated = int(refreshed_stats.get('process_allocated_mb', 0) or 0)
+                refreshed_total = 0
+                for stage in ('denoise', 'colorize', 'upscale'):
+                    refreshed_total += int(self.instance_counts.get(stage, 0)) * int(refreshed_profile.get(stage, 0))
+                self.runtime_overhead_observed_mb = max(0, int(refreshed_allocated - refreshed_total))
+
+    def _run_with_peak_measure(self, run_fn):
+        if not torch.cuda.is_available():
+            return run_fn(), 0
+
+        torch.cuda.synchronize()
+        before_reserved = torch.cuda.memory_reserved()
+        torch.cuda.reset_peak_memory_stats()
+        result = run_fn()
+        torch.cuda.synchronize()
+
+        peak_reserved = torch.cuda.max_memory_reserved()
+        after_reserved = torch.cuda.memory_reserved()
+        delta_bytes = max(0, int(max(peak_reserved, after_reserved) - before_reserved))
+        return result, _bytes_to_mb(delta_bytes)
+
+    def _run_stage_warmup_calibration(self):
+        self.stage_peak_inference_mb = {}
+        if not torch.cuda.is_available():
+            return
+        if not isinstance(self.warmup_spec, dict) or not self.warmup_spec:
+            return
+
+        warmup_h, warmup_w = self._get_warmup_input_hw()
+        warmup_image = np.zeros((warmup_h, warmup_w, 3), dtype=np.uint8)
+        denoise_sigma = int(self.warmup_spec.get('denoise_sigma', getattr(self.config, 'denoise_sigma', 25)))
+        target_width = int(self.warmup_spec.get('colorized_image_size', getattr(self.config, 'colorized_image_size', 576)))
+        force_safe_width = bool(
+            self.warmup_spec.get('force_safe_colorizer_width', getattr(self.config, 'force_safe_colorizer_width', False))
+        )
+        upscale_factor = max(1, int(self.warmup_spec.get('upscale_factor', getattr(self.config, 'upscale_factor', 4))))
+
+        try:
+            if 'denoise' in self.pools:
+                def run_denoise_stage():
+                    with torch.inference_mode()
+                        with self.pools['denoise'].checkout(timeout=1.0) as denoiser:
+                            return denoiser.denoise(warmup_image, denoise_sigma)
+
+                warmup_image, denoise_peak_mb = self._run_with_peak_measure(run_denoise_stage)
+                self.stage_peak_inference_mb['denoise'] = max(0, int(denoise_peak_mb))
+
+            if 'colorize' in self.pools:
+                luminance_source = warmup_image.copy()
+
+                effective_width = min(int(warmup_image.shape[1]), target_width)
+                if force_safe_width:
+                    effective_width = min(int(warmup_image.shape[1]), 576)
+                adjusted_width = effective_width - (effective_width % 32)
+                if adjusted_width == 0:
+                    adjusted_width = 32
+
+                def run_colorize_stage():
+                    with torch.inference_mode()
+                        with self.pools['colorize'].checkout(timeout=1.0) as colorizer:
+                            colorizer.set_image((warmup_image.astype(np.float32) / np.float32(255.0)), adjusted_width)
+                            colorized_output = colorizer.colorize()
+                    return transfer_luminance_from_source(luminance_source, colorized_output, self.config)
+
+                warmup_image, colorize_peak_mb = self._run_with_peak_measure(run_colorize_stage)
+                self.stage_peak_inference_mb['colorize'] = max(0, int(colorize_peak_mb))
+
+            if 'upscale' in self.pools:
+                def run_upscale_stage():
+                    with torch.inference_mode()
+                        with self.pools['upscale'].checkout(timeout=1.0) as upscaler:
+                            return upscaler.upscale((warmup_image.astype(np.float32) / np.float32(255.0)), upscale_factor)
+
+                warmup_image, upscale_peak_mb = self._run_with_peak_measure(run_upscale_stage)
+                self.stage_peak_inference_mb['upscale'] = max(0, int(upscale_peak_mb))
+        except Exception:
+            pass
+        finally:
+            self.cuda_after_warmup_stats = get_cuda_memory_stats_mb()
+
+    @staticmethod
+    def _queue_worker_bound(worker_count):
+        base_workers = max(1, int(worker_count))
+        return max(base_workers + 4, int(math.ceil(base_workers * 2.0)))
+
+    @staticmethod
+    def _queue_capacity_from_budget(stage_budget_bytes, item_bytes, worker_count):
+        worker_bound = ProcessingPipeline._queue_worker_bound(worker_count)
+        if stage_budget_bytes <= 0 or item_bytes <= 0:
+            return max(QUEUE_MIN_ITEMS, min(QUEUE_HARD_SAFETY_CAP, worker_bound))
+
+        budget_items = max(1, int(stage_budget_bytes // item_bytes))
+        return max(QUEUE_MIN_ITEMS, min(QUEUE_HARD_SAFETY_CAP, worker_bound, budget_items))
+
+    @staticmethod
+    def _dynamic_ram_queue_cap(available_ram_mb, active_worker_count):
+        if int(available_ram_mb) <= 0:
+            return int(QUEUE_HARD_SAFETY_CAP)
+
+        active_workers = max(1, int(active_worker_count))
+        usable_ram = max(0, int(available_ram_mb) - int(QUEUE_RAM_HEADROOM_MB))
+        ram_scaled = max(3, int(round(float(usable_ram) / 512.0)))
+        floor_scaled = max(3, active_workers + 2)
+        pressure_ceiling = max(floor_scaled, int(math.ceil(active_workers * 3.0)))
+
+        cap = max(floor_scaled, min(ram_scaled, pressure_ceiling))
+        return max(QUEUE_MIN_ITEMS, min(QUEUE_HARD_SAFETY_CAP, int(cap)))
+
+    @staticmethod
+    def _estimate_upscale_working_set_mb(input_h, input_w, upscale_factor):
+        upscale_pixels = max(1, int(input_h) * int(input_w) * int(upscale_factor) * int(upscale_factor))
+        working_bytes = max(1, upscale_pixels * 3 * 4)
+        return max(1, int(round(working_bytes / (1024 * 1024))))
+
+    def _effective_queue_budget_mb(self, transfer_config, input_h, input_w, worker_counts, upscale_factor):
+        raw_budget = getattr(transfer_config, 'pipeline_queue_ram_budget_mb', 0)
+        try:
+            configured_budget_mb = int(raw_budget)
+        except (TypeError, ValueError):
+            configured_budget_mb = 0
+
+        if configured_budget_mb > 0:
+            return max(64, configured_budget_mb), 'manual'
+
+        system_stats = get_system_memory_stats_mb()
+        if not system_stats:
+            return QUEUE_MEMORY_BUDGET_MB_DEFAULT, 'default'
+
+        available_ram_mb = int(system_stats.get('available_mb', 0))
+        if available_ram_mb <= 0:
+            return QUEUE_MEMORY_BUDGET_MB_DEFAULT, 'default'
+
+        upscale_workers = max(1, int(worker_counts.get('upscale', 1)))
+        upscale_working_set_mb = self._estimate_upscale_working_set_mb(input_h, input_w, upscale_factor)
+
+        from_available = int(available_ram_mb * QUEUE_MEMORY_BUDGET_AUTO_FRACTION)
+        from_working_set = int(upscale_working_set_mb * max(1, upscale_workers) * 0.55)
+        headroom_ceiling = max(QUEUE_MEMORY_BUDGET_MB_MIN, available_ram_mb - QUEUE_MEMORY_BUDGET_AUTO_HEADROOM_MB)
+
+        auto_budget_mb = max(QUEUE_MEMORY_BUDGET_MB_MIN, from_available, from_working_set)
+        auto_budget_mb = min(QUEUE_MEMORY_BUDGET_MB_MAX, headroom_ceiling, auto_budget_mb)
+        auto_budget_mb = max(QUEUE_MEMORY_BUDGET_MB_MIN, auto_budget_mb)
+        return int(auto_budget_mb), 'auto'
+
+    def _get_folder_input_hw(self, folder_images, transfer_config):
+        fallback_h, fallback_w = self._get_warmup_input_hw()
+        input_h = fallback_h
+        input_w = fallback_w
+
+        if folder_images:
+            sample_path = folder_images[0][0]
+            try:
+                with PIL.Image.open(sample_path) as sample_image:
+                    input_w, input_h = sample_image.size
+            except Exception:
+                input_h = fallback_h
+                input_w = fallback_w
+
+        input_limit = sanitize_input_width_limit(getattr(transfer_config, 'input_image_size', DEFAULT_INPUT_WIDTH))
+        if input_w > input_limit and input_w > 0:
+            ratio = input_limit / float(input_w)
+            input_w = int(input_limit)
+            input_h = max(1, int(round(input_h * ratio)))
+
+        return max(1, int(input_h)), max(1, int(input_w))
+
+    def _resolve_queue_probe_images(self, folder_images, output_path, source):
+        probe_images = list(folder_images or [])
+        if source != 'output' or not probe_images:
+            return probe_images
+
+        output_probe_images = []
+        for source_path, rel_dir in probe_images:
+            image_name = os.path.basename(source_path)
+            out_dir = os.path.join(output_path, rel_dir) if rel_dir else output_path
+            pass1_file = os.path.join(out_dir, image_name)
+            if os.path.exists(pass1_file):
+                output_probe_images.append((pass1_file, rel_dir))
+                if len(output_probe_images) >= 8:
+                    break
+
+        if output_probe_images:
+            return output_probe_images
+        return probe_images
+
+    def _queue_limits_for_folder(
+        self,
+        folder_images,
+        transfer_config,
+        worker_counts_override=None,
+        input_hw=None,
+        stages=None,
+        writer_workers=None,
+    ):
+        if input_hw is None:
+            input_h, input_w = self._get_folder_input_hw(folder_images, transfer_config)
+        else:
+            input_h = max(1, int(input_hw[0]))
+            input_w = max(1, int(input_hw[1]))
+
+        worker_counts = worker_counts_override if isinstance(worker_counts_override, dict) else self.worker_counts
+        writer_worker_count = max(1, int(writer_workers if writer_workers is not None else self.writer_threads))
+
+        requested_stages = set(stages or ('denoise', 'colorize', 'upscale'))
+        active_chain = [
+            stage
+            for stage in ('denoise', 'colorize', 'upscale')
+            if stage in requested_stages and stage in self.pools
+        ]
+
+        upscale_enabled = bool(getattr(transfer_config, 'upscale', False)) and 'upscale' in active_chain
+        upscale_factor = max(1, int(getattr(transfer_config, 'upscale_factor', 4))) if upscale_enabled else 1
+
+        queue_budget_mb, queue_budget_source = self._effective_queue_budget_mb(
+            transfer_config,
+            input_h,
+            input_w,
+            worker_counts,
+            upscale_factor,
+        )
+        queue_budget_bytes = int(queue_budget_mb * 1024 * 1024)
+
+        input_item_bytes = max(1, int(input_h * input_w * 3))
+        output_item_bytes = max(1, int(input_h * input_w * 3 * upscale_factor * upscale_factor))
+
+        edge_specs = []
+        if active_chain:
+            first_stage = active_chain[0]
+            edge_specs.append(
+                {
+                    'key': 'decode_to_denoise',
+                    'label': f'input->{first_stage}',
+                    'item_bytes': input_item_bytes,
+                    'worker_count': max(1, int(worker_counts.get(first_stage, 1))),
+                }
+            )
+
+            for idx in range(1, len(active_chain)):
+                previous_stage = active_chain[idx - 1]
+                next_stage = active_chain[idx]
+                edge_key = 'denoise_to_colorize' if previous_stage == 'denoise' else 'colorize_to_upscale'
+                edge_specs.append(
+                    {
+                        'key': edge_key,
+                        'label': f'{previous_stage}->{next_stage}',
+                        'item_bytes': input_item_bytes,
+                        'worker_count': max(1, int(worker_counts.get(next_stage, 1))),
+                    }
+                )
+
+            last_stage = active_chain[-1]
+            write_item_bytes = output_item_bytes if last_stage == 'upscale' else input_item_bytes
+            edge_specs.append(
+                {
+                    'key': 'upscale_to_write',
+                    'label': f'{last_stage}->write',
+                    'item_bytes': write_item_bytes,
+                    'worker_count': writer_worker_count,
+                }
+            )
+
+        edge_budgets = {}
+        if edge_specs:
+            weighted_edges = []
+            for edge in edge_specs:
+                edge_weight = math.sqrt(max(1, int(edge['item_bytes']))) * float(
+                    self._queue_worker_bound(edge['worker_count'])
+                )
+                weighted_edges.append((edge, max(1.0, float(edge_weight))))
+
+            total_weight = sum(weight for _, weight in weighted_edges)
+            remaining_budget = max(0, int(queue_budget_bytes))
+
+            for edge, weight in weighted_edges[:-1]:
+                budget = int(round(queue_budget_bytes * (weight / max(1.0, total_weight))))
+                budget = max(int(edge['item_bytes']), budget)
+                edge_budgets[edge['key']] = budget
+                remaining_budget = max(0, remaining_budget - budget)
+
+            last_edge = weighted_edges[-1][0]
+            edge_budgets[last_edge['key']] = max(int(last_edge['item_bytes']), int(remaining_budget))
+
+        system_stats = get_system_memory_stats_mb()
+        available_ram_mb = int(system_stats.get('available_mb', 0)) if system_stats else 0
+
+        limits = {
+            'decode_to_denoise': int(QUEUE_MIN_ITEMS),
+            'denoise_to_colorize': int(QUEUE_MIN_ITEMS),
+            'colorize_to_upscale': int(QUEUE_MIN_ITEMS),
+            'upscale_to_write': int(QUEUE_MIN_ITEMS),
+            'queue_budget_mb': int(queue_budget_mb),
+            'queue_budget_source': str(queue_budget_source),
+            'available_ram_mb': int(available_ram_mb),
+            'input_hw': [int(input_h), int(input_w)],
+            'upscale_factor': int(upscale_factor),
+            'input_item_mb': round(input_item_bytes / (1024 * 1024), 2),
+            'output_item_mb': round(output_item_bytes / (1024 * 1024), 2),
+            'writer_workers': int(writer_worker_count),
+            'active_stages': list(active_chain),
+        }
+
+        edge_debug = []
+        for edge in edge_specs:
+            edge_key = edge['key']
+            edge_item_bytes = max(1, int(edge['item_bytes']))
+            edge_worker_count = max(1, int(edge['worker_count']))
+            edge_budget = int(edge_budgets.get(edge_key, edge_item_bytes))
+            edge_cap = self._queue_capacity_from_budget(edge_budget, edge_item_bytes, edge_worker_count)
+            limits[edge_key] = max(int(limits.get(edge_key, QUEUE_MIN_ITEMS)), int(edge_cap))
+            edge_debug.append(
+                {
+                    'key': edge_key,
+                    'label': str(edge.get('label', edge_key)),
+                    'item_mb': round(edge_item_bytes / (1024 * 1024), 2),
+                    'budget_mb': round(edge_budget / (1024 * 1024), 2),
+                    'workers': int(edge_worker_count),
+                    'worker_bound': int(self._queue_worker_bound(edge_worker_count)),
+                    'cap': int(limits[edge_key]),
+                }
+            )
+
+        active_worker_count = int(
+            writer_worker_count
+            + sum(max(0, int(worker_counts.get(stage, 0))) for stage in active_chain)
+        )
+        ram_queue_cap = self._dynamic_ram_queue_cap(available_ram_mb, active_worker_count)
+
+        edge_worker_floor = {
+            str(edge.get('key', '')): max(QUEUE_MIN_ITEMS, int(edge.get('workers', 1)) + 2)
+            for edge in edge_debug
+            if isinstance(edge, dict)
+        }
+        # The write queue needs extra depth to absorb bursty upscale output
+        # and prevent upscale workers from blocking on queue.put().
+        # This is critical because upscale is GPU-bound but writing is I/O-bound.
+        if 'upscale_to_write' in edge_worker_floor:
+            edge_worker_floor['upscale_to_write'] = max(
+                edge_worker_floor['upscale_to_write'],
+                max(QUEUE_MIN_ITEMS, int(edge_worker_floor.get('upscale_to_write', 1)) + 6),
+            )
+
+        for key in ('decode_to_denoise', 'denoise_to_colorize', 'colorize_to_upscale', 'upscale_to_write'):
+            worker_floor = int(edge_worker_floor.get(key, QUEUE_MIN_ITEMS))
+            limits[key] = max(worker_floor, min(ram_queue_cap, int(limits.get(key, QUEUE_MIN_ITEMS))))
+
+        limits['ram_queue_cap'] = int(ram_queue_cap)
+        limits['edge_debug'] = edge_debug
+        return limits
+
+    def get_instance_vram_profile_mb(self):
+        profile = get_default_instance_vram_profile_mb()
+        for stage in ('denoise', 'colorize', 'upscale'):
+            observed = self.instance_vram_observed_mb.get(stage)
+            if observed is not None and int(observed) > 0:
+                profile[stage] = max(1, int(observed))
+        return profile
+
+    def get_vram_calibration_report(self):
+        profile = self.get_instance_vram_profile_mb()
+        shared_stage_peak = self.get_shared_stage_peak_mb()
+        worker_counts = {
+            'denoise': int(self.worker_counts.get('denoise', 0)) if 'denoise' in self.pools else 0,
+            'colorize': int(self.worker_counts.get('colorize', 0)) if 'colorize' in self.pools else 0,
+            'upscale': int(self.worker_counts.get('upscale', 0)) if 'upscale' in self.pools else 0,
+        }
+        projected_breakdown_base = estimate_vram_breakdown_mb(
+            self.instance_counts.get('denoise', 0),
+            self.instance_counts.get('colorize', 0),
+            self.instance_counts.get('upscale', 0),
+            instance_profile_mb=profile,
+            overhead_mb=self.runtime_overhead_observed_mb,
+        )
+
+        pass1_base_mb = int(projected_breakdown_base.get('pass1_total_mb', 0) or 0)
+        pass2_base_mb = int(projected_breakdown_base.get('pass2_total_mb', 0) or 0)
+        pass1_shared_mb = 0
+        pass2_shared_mb = 0
+
+        if pass1_base_mb > 0:
+            pass1_shared_mb = max(
+                int(shared_stage_peak.get('denoise', 0) or 0),
+                int(shared_stage_peak.get('colorize', 0) or 0),
+            )
+        if pass2_base_mb > 0:
+            pass2_shared_mb = int(shared_stage_peak.get('upscale', 0) or 0)
+
+        projected_pass1_mb = pass1_base_mb + pass1_shared_mb if pass1_base_mb > 0 else 0
+        projected_pass2_mb = pass2_base_mb + pass2_shared_mb if pass2_base_mb > 0 else 0
+
+        if projected_pass1_mb <= 0 and projected_pass2_mb <= 0:
+            projected_peak_pass = 'none'
+            projected_peak_mb = 0
+        elif projected_pass1_mb >= projected_pass2_mb:
+            projected_peak_pass = 'pass1'
+            projected_peak_mb = projected_pass1_mb
+        else:
+            projected_peak_pass = 'pass2'
+            projected_peak_mb = projected_pass2_mb
+
+        observed_stages = {
+            stage
+            for stage in ('denoise', 'colorize', 'upscale')
+            if int(self.instance_vram_observed_mb.get(stage, 0) or 0) > 0
+        }
+        heuristic_stages = {
+            stage
+            for stage in ('denoise', 'colorize', 'upscale')
+            if stage not in observed_stages
+        }
+        if self.stage_peak_inference_mb:
+            projection_source = 'warmup_peak'
+        elif observed_stages and heuristic_stages:
+            projection_source = 'init_delta+heuristic'
+        elif observed_stages:
+            projection_source = 'init_delta'
+        else:
+            projection_source = 'default_heuristic'
+
+        return {
+            'instance_counts': dict(self.instance_counts),
+            'worker_counts': dict(worker_counts),
+            'instance_vram_profile_mb': profile,
+            'instance_vram_profile_base_mb': dict(profile),
+            'stage_peak_inference_mb': dict(self.stage_peak_inference_mb),
+            'shared_stage_peak_mb': dict(shared_stage_peak),
+            'shared_pass1_mb': int(pass1_shared_mb),
+            'shared_pass2_mb': int(pass2_shared_mb),
+            'runtime_overhead_mb': int(self.runtime_overhead_observed_mb),
+            'projected_total_mb': int(projected_peak_mb),
+            'projected_peak_mb': int(projected_peak_mb),
+            'projected_pass1_base_mb': int(pass1_base_mb),
+            'projected_pass2_base_mb': int(pass2_base_mb),
+            'projected_pass1_mb': int(projected_pass1_mb),
+            'projected_pass2_mb': int(projected_pass2_mb),
+            'projected_peak_pass': str(projected_peak_pass),
+            'projection_source': str(projection_source),
+            'adaptive_upscale_limit': dict(self.adaptive_upscale_limit),
+            'warmup_input_hw': list(self._get_warmup_input_hw()),
+            'warmup_upscale_factor': int(self.warmup_spec.get('upscale_factor', getattr(self.config, 'upscale_factor', 4))),
+            'writer_threads': int(self.writer_threads),
+            'cuda_baseline': dict(self.cuda_baseline_stats) if self.cuda_baseline_stats else {},
+            'cuda_after_pool': dict(self.cuda_after_pool_stats) if self.cuda_after_pool_stats else {},
+            'cuda_after_warmup': dict(self.cuda_after_warmup_stats) if self.cuda_after_warmup_stats else {},
+        }
+
+    def _create_pools(self, stages):
+        for stage in stages:
+            if stage in self.pools:
+                continue
+
+            factory = self.model_factories.get(stage)
+            count = int(self.instance_counts.get(stage, 0))
+            if not callable(factory) or count <= 0:
+                continue
+
+            stage_before = get_cuda_memory_stats_mb() if torch.cuda.is_available() else {}
+            self.pools[stage] = ModelInstancePool(factory, count, stage)
+            stage_after = get_cuda_memory_stats_mb() if torch.cuda.is_available() else {}
+
+            precision_summary = self.pools[stage].precision_summary
+            if precision_summary:
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': f"[*] {stage} precision => {precision_summary}",
+                    },
+                    level=LogLevel.DEBUG,
+                )
+
+            if stage_before and stage_after:
+                before_reserved = int(stage_before.get('process_reserved_mb', 0))
+                after_reserved = int(stage_after.get('process_reserved_mb', before_reserved))
+                delta = max(0, after_reserved - before_reserved)
+                if delta <= 0:
+                    before_alloc = int(stage_before.get('process_allocated_mb', 0))
+                    after_alloc = int(stage_after.get('process_allocated_mb', before_alloc))
+                    delta = max(0, after_alloc - before_alloc)
+                if delta > 0:
+                    self.instance_vram_observed_mb[stage] = max(1, int(round(delta / max(1, count))))
+
+            if stage_after:
+                self.cuda_after_pool_stats = stage_after
+
+            observed = self.instance_vram_observed_mb.get(stage)
+            observed_text = f' (~{observed} MB/inst)' if observed is not None else ''
+            self._emit(
+                {
+                    'type': 'log',
+                    'message': f"[*] Loaded {count} {stage} instance(s){observed_text}",
+                },
+                level=LogLevel.DEBUG,
+            )
+
+    def _unload_pools(self, stages):
+        unloaded = []
+        for stage in stages:
+            pool = self.pools.pop(stage, None)
+            if pool is None:
+                continue
+            instances = pool.drain()
+            for instance in instances:
+                del instance
+            del instances
+            unloaded.append(stage)
+
+        if unloaded:
+            gc.collect()
+            clear_torch_cache()
+            self._emit(
+                {
+                    'type': 'log',
+                    'message': f"[*] Unloaded pools: {', '.join(unloaded)}. GC + CUDA cache cleared.",
+                },
+                level=LogLevel.DEBUG,
+            )
+
+    def _count_pass1_outputs(self, grouped_by_folder, output_path):
+        count = 0
+        for rel_dir, folder_images in grouped_by_folder.items():
+            out_dir = os.path.join(output_path, rel_dir) if rel_dir else output_path
+            for path, _ in folder_images:
+                name = os.path.basename(path)
+                if os.path.exists(os.path.join(out_dir, name)):
+                    count += 1
+        return count
+
+    def _emit_calibration_report(self):
+        report = self.get_vram_calibration_report()
+        self._emit(
+            {
+                'type': 'pipeline_calibration',
+                'report': report,
+            },
+            level=LogLevel.TRACE,
+        )
+
+    def _elide_path(self, rel_dir):
+        rel_text = str(rel_dir or '').replace('\\', '/')
+        parts = [p for p in rel_text.split('/') if p]
+        if len(parts) <= 2:
+            return rel_text
+        return f"{parts[0]} -> {'/'.join(parts[-2:])}"
+
+    def _check_folder_skip(self, folder_images, output_path, rel_dir, overwrite, pass_stop_event=None):
+        if overwrite:
+            return False, 0, ''
+
+        skipped = []
+        needs_processing = []
+        out_dir = os.path.join(output_path, rel_dir) if rel_dir else output_path
+
+        for path, _ in folder_images:
+            if not self._wait_while_paused(pass_stop_event):
+                return False, len(skipped), ''
+            name = os.path.basename(path)
+            out_file = os.path.join(out_dir, name)
+            if os.path.exists(out_file):
+                skipped.append(name)
+            else:
+                needs_processing.append(name)
+
+        if skipped and not needs_processing:
+            return True, len(skipped), f"all {len(skipped)} skipped ({skipped[0]}->{skipped[-1]})"
+
+        return False, len(skipped), ''
+
+    def _check_upscale_skip(self, folder_images, output_path, rel_dir, transfer_config, pass_stop_event=None):
+        """Fast upscale skip check using file size as proxy instead of opening images.
+
+        An upscaled 4x image is always dramatically larger than its source.
+        We use a file-size ratio check (output >= source * 1.5) as a fast proxy
+        to avoid the expensive PIL.Image.open() calls that caused 27s-90s hangs
+        at folder transitions.
+        """
+        skipped = []
+        needs_processing = []
+        out_dir = os.path.join(output_path, rel_dir) if rel_dir else output_path
+
+        for source_path, _ in folder_images:
+            if not self._wait_while_paused(pass_stop_event):
+                return False, len(skipped), ''
+            name = os.path.basename(source_path)
+            out_file = os.path.join(out_dir, name)
+
+            if not os.path.exists(out_file):
+                needs_processing.append(name)
+                continue
+
+            # Fast path: use file size ratio as proxy for "already upscaled".
+            # A 4x upscaled image has ~16x the pixels, so its file is always
+            # significantly larger than the source. A ratio of 1.5x is a safe
+            # conservative threshold that avoids false positives.
+            try:
+                src_size = os.path.getsize(source_path)
+                out_size = os.path.getsize(out_file)
+                if src_size > 0 and out_size >= int(src_size * 1.5):
+                    skipped.append(name)
+                    continue
+            except OSError:
+                pass
+
+            needs_processing.append(name)
+
+        if skipped and not needs_processing:
+            return True, len(skipped), f"all {len(skipped)} already upscaled ({skipped[0]}->{skipped[-1]})"
+
+        return False, len(skipped), ''
+
+    def _force_put(self, q, item, timeout=0.5, pass_stop_event=None, queue_name='queue', detailed_logs=False):
+        started_at = time.monotonic()
+        last_report_at = started_at
+
+        while True:
+            try:
+                q.put(item, timeout=timeout)
+                if detailed_logs:
+                    waited = max(0.0, time.monotonic() - started_at)
+                    if waited >= QUEUE_DIAG_WAIT_WARN_S:
+                        self._emit(
+                            {
+                                'type': 'log',
+                                'message': (
+                                    '[*] Sentinel enqueue cleared => '
+                                    f'{queue_name} '
+                                    f'wait:{waited:.1f}s '
+                                    f'q:{_queue_state_text(q)}'
+                                ),
+                            },
+                            level=LogLevel.DEBUG,
+                        )
+                return True
+            except queue.Full:
+                terminate_set = self.terminate_event.is_set()
+                pass_stop_set = bool(pass_stop_event.is_set()) if isinstance(pass_stop_event, threading.Event) else False
+                if terminate_set or pass_stop_set:
+                    waited = max(0.0, time.monotonic() - started_at)
+                    self._emit(
+                        {
+                            'type': 'log',
+                            'message': (
+                                '[!] Sentinel enqueue aborted => '
+                                f'{queue_name} '
+                                f'wait:{waited:.1f}s '
+                                f'q:{_queue_state_text(q)} '
+                                f'({self._stop_state_text(pass_stop_event)})'
+                            ),
+                        },
+                        level=LogLevel.WARNING,
+                    )
+                    return False
+
+                if detailed_logs:
+                    now = time.monotonic()
+                    waited = max(0.0, now - started_at)
+                    if waited >= QUEUE_DIAG_WAIT_WARN_S and (now - last_report_at) >= QUEUE_DIAG_WAIT_REPORT_INTERVAL_S:
+                        self._emit(
+                            {
+                                'type': 'log',
+                                'message': (
+                                    '[*] Sentinel enqueue wait => '
+                                    f'{queue_name} '
+                                    f'wait:{waited:.1f}s '
+                                    f'q:{_queue_state_text(q)} '
+                                    f'({self._stop_state_text(pass_stop_event)})'
+                                ),
+                            },
+                            level=LogLevel.DEBUG,
+                        )
+                        last_report_at = now
+                continue
+
+    def _drain_all_queues(self, *queues_to_drain):
+        for work_q in queues_to_drain:
+            while True:
+                try:
+                    item = work_q.get_nowait()
+                    if isinstance(item, dict):
+                        item['image'] = None
+                        item.clear()
+                    work_q.task_done()
+                except queue.Empty:
+                    break
+
+    def _get_stage_queues(self, stage, stages, queues, write_queue):
+        active_chain = [s for s in ('denoise', 'colorize', 'upscale') if s in stages and s in self.pools]
+        stage_idx = active_chain.index(stage)
+
+        if stage_idx == 0:
+            in_q = queues.get('to_denoise') or queues.get('to_colorize') or queues.get('to_upscale')
+        elif stage == 'colorize' and 'denoise' in active_chain:
+            in_q = queues['from_denoise']
+        elif stage == 'upscale' and 'colorize' in active_chain:
+            in_q = queues['from_colorize']
+        elif stage == 'upscale' and 'denoise' in active_chain:
+            in_q = queues['from_denoise']
+        else:
+            in_q = queues.get(f'to_{stage}', write_queue)
+
+        if stage_idx < len(active_chain) - 1:
+            next_stage = active_chain[stage_idx + 1]
+            out_q = queues.get(f'from_{stage}', queues.get(f'to_{next_stage}', write_queue))
+        else:
+            out_q = write_queue
+
+        return in_q, out_q
+
+    def _get_first_queue(self, stages, queues, write_queue=None):
+        for stage in ('denoise', 'colorize', 'upscale'):
+            if stage in stages:
+                return queues.get(f'to_{stage}') or queues.get(f'from_{stage}')
+        # No GPU stages — route directly to writer (Color Transfer Only mode)
+        return write_queue
+
+    def _get_first_stage_worker_count(self, stages):
+        for stage in ('denoise', 'colorize', 'upscale'):
+            if stage in stages and stage in self.pools:
+                return max(1, int(self.worker_counts.get(stage, 1)))
+        return 1
+
+    def _persistent_producer(
+        self,
+        grouped_by_folder,
+        output_path,
+        overwrite,
+        detailed_logs,
+        transfer_config,
+        source,
+        stages,
+        queues,
+        stop_events,
+        pass_stop_event,
+        stats,
+        stats_lock,
+        diag_ctx=None,
+    ):
+        first_queue = self._get_first_queue(stages, queues, write_queue=queues.get('__write_queue'))
+        total_worker_count = self._get_first_stage_worker_count(stages)
+        global_seq = 0
+
+        is_passthrough = len(stages) == 0  # Color Transfer Only mode
+        first_stage_name = 'writer' if is_passthrough else (
+            'denoise' if 'denoise' in stages else 'colorize' if 'colorize' in stages else 'upscale'
+        )
+        first_queue_name = f'to_{first_stage_name}'
+        producer_item_ref = {'item': '?'}
+        producer_wait_diag = self._make_safe_put_diag(
+            detailed_logs=detailed_logs,
+            pass_stop_event=pass_stop_event,
+            owner='producer',
+            queue_name=first_queue_name,
+            item_ref=producer_item_ref,
+        )
+
+        for rel_dir, folder_images in grouped_by_folder.items():
+            if not self._wait_while_paused(pass_stop_event):
+                break
+
+            if self._is_stop_requested(pass_stop_event):
+                break
+
+            folder_name = os.path.basename(os.path.normpath(rel_dir)) if rel_dir else os.path.basename(
+                os.path.normpath(getattr(self.config, 'input_folder', '') or output_path)
+            )
+            display_path = self._elide_path(rel_dir) if rel_dir else folder_name
+
+            scan_started = time.monotonic()
+
+            if source == 'input':
+                all_skipped, skip_count, skip_summary = self._check_folder_skip(
+                    folder_images,
+                    output_path,
+                    rel_dir,
+                    overwrite,
+                    pass_stop_event=pass_stop_event,
+                )
+            else:
+                all_skipped, skip_count, skip_summary = self._check_upscale_skip(
+                    folder_images,
+                    output_path,
+                    rel_dir,
+                    transfer_config,
+                    pass_stop_event=pass_stop_event,
+                )
+
+            scan_elapsed = max(0.0, time.monotonic() - scan_started)
+            if detailed_logs:
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': (
+                            '[*] Skip scan => '
+                            f'{display_path} '
+                            f'files:{len(folder_images)} '
+                            f'skipped:{int(skip_count)} '
+                            f'all_skipped:{int(bool(all_skipped))} '
+                            f'time:{scan_elapsed:.2f}s '
+                            f'source:{source}'
+                        ),
+                    },
+                    level=LogLevel.DEBUG,
+                )
+
+            if all_skipped:
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': f"[~] {display_path}: {skip_summary}",
+                    },
+                    level=LogLevel.DEBUG,
+                )
+                with stats_lock:
+                    stats['skipped'] += int(skip_count)
+                    stats['folders_done'] += 1
+                continue
+
+            folder_item_count = 0
+            for full_image_path, _rel in folder_images:
+                if self.terminate_event.is_set() or pass_stop_event.is_set():
+                    break
+
+                image_name = os.path.basename(full_image_path)
+
+                if source == 'input':
+                    out_dir = os.path.join(output_path, rel_dir) if rel_dir else output_path
+                    out_file = os.path.join(out_dir, image_name)
+                    if not overwrite and os.path.exists(out_file):
+                        with stats_lock:
+                            stats['skipped'] += 1
+                        continue
+
+                try:
+                    if source == 'input':
+                        with PIL.Image.open(full_image_path) as pil_img:
+                            image = np.array(pil_img.convert('RGB'))
+                        
+                        # Do not clamp input size if we are in Color Transfer Only bypass mode
+                        if not is_passthrough:
+                            input_limit = sanitize_input_width_limit(
+                                getattr(transfer_config, 'input_image_size', DEFAULT_INPUT_WIDTH)
+                            )
+                            image, _, _, _ = clamp_image_to_input_width(image, input_limit)
+                    else:
+                        out_dir = os.path.join(output_path, rel_dir) if rel_dir else output_path
+                        pass1_file = os.path.join(out_dir, image_name)
+                        if not os.path.exists(pass1_file):
+                            continue
+
+                        # Fast per-image upscale skip: use file size ratio instead of
+                        # opening the source image to read dimensions (which causes stalls).
+                        try:
+                            src_file_size = os.path.getsize(full_image_path)
+                            pass1_file_size = os.path.getsize(pass1_file)
+                            if src_file_size > 0 and pass1_file_size >= int(src_file_size * 1.5):
+                                with stats_lock:
+                                    stats['skipped'] += 1
+                                continue
+                        except OSError:
+                            pass
+
+                        with PIL.Image.open(pass1_file) as pil_img:
+                            image = np.array(pil_img.convert('RGB'))
+
+                    skip_colorize = False
+                    if source == 'input' and 'colorize' in stages:
+                        coloredness = distance_from_grayscale(PIL.Image.fromarray(image))
+                        if coloredness > 15:
+                            skip_colorize = True
+                            if not any(s in stages for s in ('denoise', 'upscale')):
+                                with stats_lock:
+                                    stats['skipped'] += 1
+                                continue
+
+                    created_mono = time.monotonic()
+
+                    item = {
+                        'global_seq': int(global_seq),
+                        'image_name': image_name,
+                        'image_path': full_image_path,
+                        'image': image,
+                        'skip_colorize': bool(skip_colorize),
+                        'rel_dir': rel_dir,
+                        'output_path': output_path,
+                        'started_at': time.time(),
+                        'folder_name': display_path,
+                        '_created_at_mono': created_mono,
+                        '_timing': {},
+                    }
+
+                    # In passthrough mode (no GPU stages), items go directly to writer
+                    if is_passthrough:
+                        item['status'] = 'ready'
+                        item['duration'] = 0.0
+
+                    producer_item_ref['item'] = f'{display_path}/{image_name}'
+                    enqueue_started = time.monotonic()
+                    if not safe_put(first_queue, item, stop_events, diag=producer_wait_diag):
+                        break
+
+                    enqueued_mono = time.monotonic()
+                    item['_last_enqueued_at'] = enqueued_mono
+                    item['_timing']['producer_outbound_wait_s'] = max(0.0, enqueued_mono - enqueue_started)
+
+                    if isinstance(diag_ctx, dict) and bool(diag_ctx.get('enabled', False)):
+                        inflight_lock = diag_ctx.get('inflight_lock')
+                        inflight = diag_ctx.get('inflight')
+                        if isinstance(inflight, dict) and hasattr(inflight_lock, 'acquire'):
+                            with inflight_lock:
+                                inflight[item['global_seq']] = float(item.get('_created_at_mono', enqueued_mono))
+
+                    global_seq += 1
+                    folder_item_count += 1
+
+                except Exception as decode_err:
+                    self._emit(
+                        {
+                            'type': 'log',
+                            'message': f"[!!!] Failed to decode {image_name}: {decode_err}",
+                        },
+                        level=LogLevel.ERROR,
+                    )
+                    with stats_lock:
+                        stats['failed'] += 1
+                    if self.fail_fast:
+                        pass_stop_event.set()
+                        break
+
+            if folder_item_count > 0:
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': f"[*] {display_path}: queued {folder_item_count} images",
+                    },
+                    level=LogLevel.DEBUG,
+                )
+
+            with stats_lock:
+                stats['folders_done'] += 1
+
+        # In passthrough mode, _run_pass handles writer sentinels directly.
+        if not is_passthrough:
+            for _ in range(total_worker_count):
+                if not self._force_put(
+                    first_queue,
+                    None,
+                    pass_stop_event=pass_stop_event,
+                    queue_name=f'producer->{first_queue_name}',
+                    detailed_logs=detailed_logs,
+                ):
+                    break
+
+    def _persistent_stage_worker(
+        self,
+        stage,
+        in_q,
+        out_q,
+        stop_events,
+        pass_stop_event,
+        transfer_config,
+        detailed_logs,
+        diag_ctx=None,
+    ):
+        stage_item_ref = {'item': '?'}
+        stage_out_diag = self._make_safe_put_diag(
+            detailed_logs=detailed_logs,
+            pass_stop_event=pass_stop_event,
+            owner=f'{stage}-worker',
+            queue_name=f'{stage}-out',
+            item_ref=stage_item_ref,
+        )
+        stage_retry_diag = self._make_safe_put_diag(
+            detailed_logs=detailed_logs,
+            pass_stop_event=pass_stop_event,
+            owner=f'{stage}-retry',
+            queue_name=f'{stage}-in',
+            item_ref=stage_item_ref,
+        )
+
+        while True:
+            if not self._wait_while_paused(pass_stop_event):
+                break
+
+            if self._is_stop_requested(pass_stop_event):
+                break
+
+            try:
+                item = in_q.get(timeout=0.5)
+            except queue.Empty:
+                if self._is_stop_requested(pass_stop_event):
+                    break
+                continue
+
+            if item is None:
+                in_q.task_done()
+                break
+
+            stage_recv_mono = time.monotonic()
+            stage_item_ref['item'] = str(item.get('image_name', '?'))
+            timing = item.get('_timing') if isinstance(item, dict) else None
+            if not isinstance(timing, dict):
+                timing = {}
+                if isinstance(item, dict):
+                    item['_timing'] = timing
+
+            last_enqueued_at = float(item.get('_last_enqueued_at', stage_recv_mono))
+            timing[f'{stage}_intake_wait_s'] = max(0.0, stage_recv_mono - last_enqueued_at)
+            stage_compute_started = stage_recv_mono
+
+            try:
+                if stage == 'denoise' and 'denoise' in self.pools:
+                    with torch.inference_mode()
+                        with self.pools['denoise'].checkout(stop_events=stop_events) as denoiser:
+                            sigma = getattr(transfer_config, 'denoise_sigma', 25)
+                            item['image'] = denoiser.denoise(
+                                item['image'],
+                                sigma,
+                                image_name=item.get('image_name'),
+                            )
+
+                elif stage == 'colorize' and 'colorize' in self.pools:
+                    if not item.get('skip_colorize', False):
+                        working_np = item['image']
+                        luminance_source = working_np
+
+                        target_width = int(getattr(transfer_config, 'colorized_image_size', 576))
+                        if bool(getattr(transfer_config, 'force_safe_colorizer_width', False)):
+                            target_width = 576
+
+                        original_width = working_np.shape[1]
+                        effective_width = min(original_width, target_width)
+                        adjusted_width = effective_width - (effective_width % 32)
+                        if adjusted_width == 0:
+                            adjusted_width = 32
+
+                        with torch.inference_mode()
+                            with self.pools['colorize'].checkout(stop_events=stop_events) as colorizer:
+                                normalized_input = working_np.astype(np.float32, copy=False)
+                                normalized_input *= np.float32(1.0 / 255.0)
+                                colorizer.set_image(
+                                    normalized_input,
+                                    adjusted_width,
+                                    image_name=item.get('image_name'),
+                                )
+                                colorized_output = colorizer.colorize()
+
+                        import copy
+                        local_transfer_config = copy.copy(transfer_config)
+                        local_transfer_config.current_image_path = item.get('image_path')
+                        
+                        try:
+                            import os
+                            ocr_debug_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ocr_debug")
+                            with open(os.path.join(ocr_debug_dir, "log_pipeline.txt"), "a") as f:
+                                f.write(f"pipeline.py: item.get('image_path')={item.get('image_path')}, local_config_path={getattr(local_transfer_config, 'current_image_path', 'NONE')}\n")
+                        except Exception:
+                            pass
+
+                        item['image'] = transfer_luminance_from_source(
+                            luminance_source,
+                            colorized_output,
+                            local_transfer_config,
+                        )
+                        del normalized_input, luminance_source, working_np, colorized_output
+
+                elif stage == 'upscale' and 'upscale' in self.pools:
+                    with torch.inference_mode()
+                        with self.pools['upscale'].checkout(stop_events=stop_events) as upscaler:
+                            upscale_factor = getattr(transfer_config, 'upscale_factor', 4)
+                            normalized_input = item['image'].astype(np.float32, copy=False)
+                            normalized_input *= np.float32(1.0 / 255.0)
+                            item['image'] = upscaler.upscale(
+                                normalized_input,
+                                upscale_factor,
+                                image_name=item.get('image_name'),
+                            )
+                            del normalized_input
+
+                item.pop('_retried_memory', None)
+                item['status'] = 'ready'
+                item['duration'] = time.time() - item.get('started_at', time.time())
+                stage_compute_done = time.monotonic()
+                timing[f'{stage}_compute_s'] = max(0.0, stage_compute_done - stage_compute_started)
+
+                out_enqueue_started = time.monotonic()
+                if not safe_put(out_q, item, (self.terminate_event,), diag=stage_out_diag):
+                    pass_stop_event.set()
+                else:
+                    out_enqueued_at = time.monotonic()
+                    item['_last_enqueued_at'] = out_enqueued_at
+                    timing[f'{stage}_outbound_wait_s'] = max(0.0, out_enqueued_at - out_enqueue_started)
+
+                    if detailed_logs:
+                        stage_intake_s = float(timing.get(f'{stage}_intake_wait_s', 0.0) or 0.0)
+                        stage_compute_s = float(timing.get(f'{stage}_compute_s', 0.0) or 0.0)
+                        stage_outbound_s = float(timing.get(f'{stage}_outbound_wait_s', 0.0) or 0.0)
+                        if max(stage_intake_s, stage_compute_s, stage_outbound_s) >= QUEUE_DIAG_SLOW_STAGE_S:
+                            self._emit(
+                                {
+                                    'type': 'log',
+                                    'message': (
+                                        '[*] Stage latency => '
+                                        f'{stage} '
+                                        f'item:{item.get("image_name", "?")} '
+                                        f'intake:{stage_intake_s:.2f}s '
+                                        f'compute:{stage_compute_s:.2f}s '
+                                        f'outbound:{stage_outbound_s:.2f}s '
+                                        f'in_q:{_queue_state_text(in_q)} '
+                                        f'out_q:{_queue_state_text(out_q)}'
+                                    ),
+                                },
+                                level=LogLevel.DEBUG,
+                            )
+
+            except _PipelineAborted:
+                item['image'] = None
+                pass_stop_event.set()
+                break
+            except Exception as err:
+                err_text = str(err)
+                is_memory_error = isinstance(err, MemoryError) or ('Unable to allocate' in err_text)
+                if is_memory_error and not bool(item.get('_retried_memory', False)):
+                    item['_retried_memory'] = True
+                    self._emit(
+                        {
+                            'type': 'log',
+                            'message': f"[!] {stage} hit host-memory pressure for {item.get('image_name', '?')}; retrying once after GC.",
+                        },
+                        level=LogLevel.WARNING,
+                    )
+                    gc.collect()
+                    clear_torch_cache()
+                    # Cooldown after OOM to let other workers finish their current
+                    # items before this retry re-enters the GPU. Prevents concurrent
+                    # OOM → GC storms from multiple workers.
+                    time.sleep(0.5)
+                    if item.get('image') is not None:
+                        stage_item_ref['item'] = str(item.get('image_name', '?'))
+                        retry_started = time.monotonic()
+                        if safe_put(in_q, item, stop_events, diag=stage_retry_diag):
+                            retry_enqueued = time.monotonic()
+                            item['_last_enqueued_at'] = retry_enqueued
+                            timing[f'{stage}_retry_wait_s'] = max(0.0, retry_enqueued - retry_started)
+                            continue
+                        pass_stop_event.set()
+                    else:
+                        self._emit(
+                            {
+                                'type': 'log',
+                                'message': (
+                                    f"[!] {stage} retry skipped for {item.get('image_name', '?')}: "
+                                    "image data freed by GC."
+                                ),
+                            },
+                            level=LogLevel.WARNING,
+                        )
+
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': f"[!!!] {stage} failed for {item.get('image_name', '?')}: {err_text}",
+                    },
+                    level=LogLevel.ERROR,
+                )
+                item['image'] = None
+                item['status'] = 'failed'
+                item['error'] = err_text
+                item['duration'] = time.time() - item.get('started_at', time.time())
+                stage_item_ref['item'] = str(item.get('image_name', '?'))
+                fail_enqueue_started = time.monotonic()
+                if safe_put(out_q, item, (self.terminate_event,), diag=stage_out_diag):
+                    fail_enqueued = time.monotonic()
+                    item['_last_enqueued_at'] = fail_enqueued
+                    timing[f'{stage}_outbound_wait_s'] = max(0.0, fail_enqueued - fail_enqueue_started)
+                if self.fail_fast:
+                    pass_stop_event.set()
+            finally:
+                in_q.task_done()
+
+    def _persistent_writer(
+        self,
+        write_queue,
+        output_path,
+        stop_events,
+        stats,
+        stats_lock,
+        total_images,
+        pass_name,
+        detailed_logs,
+        progress_start,
+        progress_end,
+        diag_ctx=None,
+        transfer_config=None,
+    ):
+        def _writer_stop_requested():
+            return bool(self.terminate_event.is_set())
+
+        while True:
+            while self.pause_event.is_set() and not _writer_stop_requested():
+                time.sleep(0.2)
+
+            if _writer_stop_requested() and write_queue.empty():
+                break
+
+            try:
+                item = write_queue.get(timeout=0.5)
+            except queue.Empty:
+                if _writer_stop_requested():
+                    break
+                continue
+
+            if item is None:
+                write_queue.task_done()
+                break
+
+            writer_recv_mono = time.monotonic()
+            try:
+                status = item.get('status', 'failed')
+                image_name = item.get('image_name', 'unknown')
+                rel_dir = item.get('rel_dir', '')
+                duration = float(item.get('duration', 0.0))
+                folder_name = item.get('folder_name', '')
+                timing = item.get('_timing') if isinstance(item, dict) else None
+                if not isinstance(timing, dict):
+                    timing = {}
+                    if isinstance(item, dict):
+                        item['_timing'] = timing
+
+                last_enqueued_at = float(item.get('_last_enqueued_at', writer_recv_mono))
+                writer_queue_wait_s = max(0.0, writer_recv_mono - last_enqueued_at)
+                timing['writer_queue_wait_s'] = writer_queue_wait_s
+                write_io_s = 0.0
+
+                if status == 'ready':
+                    # Apply external color transfer if enabled
+                    ext_enabled = bool(
+                        getattr(transfer_config, 'external_color_source_enabled', False)
+                    ) if transfer_config else False
+                    if ext_enabled and item['image'] is not None:
+                        ext_key = (rel_dir, image_name)
+                        ext_path = self._external_color_map.get(ext_key)
+                        if ext_path and os.path.exists(ext_path):
+                            try:
+                                ext_img = np.array(PIL.Image.open(ext_path).convert('RGB'))
+                                ext_cfg = copy.copy(transfer_config)
+                                ext_cfg.current_image_path = item.get('image_path')
+                                ext_cfg.edge_chroma_protection = False
+                                ext_cfg.line_ink_protection = False
+                                ext_cfg.screentone_chroma_smoothing = False
+                                item['image'] = transfer_luminance_from_source(
+                                    item['image'], ext_img, ext_cfg,
+                                )
+                                del ext_img
+                            except Exception as ext_err:
+                                self._emit(
+                                    {
+                                        'type': 'log',
+                                        'message': f"[!] External color transfer failed for {image_name}: {ext_err}",
+                                    },
+                                    level=LogLevel.WARNING,
+                                )
+                        elif ext_path is None:
+                            self._emit(
+                                {
+                                    'type': 'log',
+                                    'message': f"[!] No external color match for {image_name}, saving without color transfer",
+                                },
+                                level=LogLevel.WARNING,
+                            )
+
+                    write_started_mono = time.monotonic()
+                    out_dir = os.path.join(output_path, rel_dir) if rel_dir else output_path
+                    os.makedirs(out_dir, exist_ok=True)
+                    save_image(item['image'], os.path.join(out_dir, image_name))
+                    write_io_s = max(0.0, time.monotonic() - write_started_mono)
+                    timing['writer_io_s'] = write_io_s
+                    item['image'] = None
+                    with stats_lock:
+                        stats['completed'] += 1
+
+                    if detailed_logs:
+                        self._emit(
+                            {
+                                'type': 'log',
+                                'message': f"[+] {folder_name}/{image_name} done in {duration:.2f}s",
+                            },
+                            level=LogLevel.VERBOSE,
+                        )
+
+                elif status == 'failed':
+                    with stats_lock:
+                        stats['failed'] += 1
+                    error_text = item.get('error', 'Unknown')
+                    self._emit(
+                        {
+                            'type': 'log',
+                            'message': f"[!!!] FAILED {image_name}: {error_text}",
+                        },
+                        level=LogLevel.ERROR,
+                    )
+                elif status == 'skipped':
+                    with stats_lock:
+                        stats['skipped'] += 1
+                else:
+                    with stats_lock:
+                        stats['cancelled'] += 1
+
+                with stats_lock:
+                    done_total = int(stats['completed'] + stats['skipped'] + stats['failed'] + stats['cancelled'])
+
+                end_to_end_s = max(0.0, time.monotonic() - float(item.get('_created_at_mono', writer_recv_mono)))
+                timing['end_to_end_s'] = end_to_end_s
+
+                if detailed_logs and max(writer_queue_wait_s, write_io_s, end_to_end_s) >= QUEUE_DIAG_SLOW_STAGE_S:
+                    self._emit(
+                        {
+                            'type': 'log',
+                            'message': (
+                                '[*] Item latency => '
+                                f'{folder_name}/{image_name} '
+                                f'writer_q:{writer_queue_wait_s:.2f}s '
+                                f'write_io:{write_io_s:.2f}s '
+                                f'e2e:{end_to_end_s:.2f}s '
+                                f'write_q:{_queue_state_text(write_queue)}'
+                            ),
+                        },
+                        level=LogLevel.DEBUG,
+                    )
+
+                if isinstance(diag_ctx, dict) and bool(diag_ctx.get('enabled', False)):
+                    inflight = diag_ctx.get('inflight')
+                    inflight_lock = diag_ctx.get('inflight_lock')
+                    seq = item.get('global_seq')
+                    if isinstance(inflight, dict) and hasattr(inflight_lock, 'acquire') and seq is not None:
+                        with inflight_lock:
+                            inflight.pop(int(seq), None)
+
+                    writer_lock = diag_ctx.get('writer_lock')
+                    if hasattr(writer_lock, 'acquire'):
+                        with writer_lock:
+                            now = time.monotonic()
+                            diag_ctx['last_progress_at'] = now
+
+                            if status == 'ready':
+                                writer_samples_ms = diag_ctx.setdefault('writer_samples_ms', [])
+                                writer_samples_ms.append(float(write_io_s * 1000.0))
+                                if len(writer_samples_ms) > 256:
+                                    del writer_samples_ms[:-256]
+
+                            last_report_at = float(diag_ctx.get('writer_last_report_at', now))
+                            if detailed_logs and (now - last_report_at) >= QUEUE_DIAG_WRITER_REPORT_INTERVAL_S:
+                                interval_s = max(0.001, now - last_report_at)
+                                previous_done = int(diag_ctx.get('writer_last_done', 0) or 0)
+                                delta_done = max(0, int(done_total) - previous_done)
+                                done_rate = float(delta_done) / interval_s
+                                avg_ms, p95_ms, max_ms = self._latency_summary_ms(diag_ctx.get('writer_samples_ms', []))
+
+                                self._emit(
+                                    {
+                                        'type': 'log',
+                                        'message': (
+                                            '[*] Writer stats => '
+                                            f'rate:{done_rate:.2f}/s '
+                                            f'avg:{avg_ms:.1f}ms '
+                                            f'p95:{p95_ms:.1f}ms '
+                                            f'max:{max_ms:.1f}ms '
+                                            f'write_q:{_queue_state_text(write_queue)} '
+                                            f'done:{done_total}/{total_images}'
+                                        ),
+                                    },
+                                    level=LogLevel.DEBUG,
+                                )
+                                diag_ctx['writer_last_report_at'] = now
+                                diag_ctx['writer_last_done'] = int(done_total)
+
+                if total_images > 0:
+                    local_progress = min(100.0, (done_total / float(total_images)) * 100.0)
+                else:
+                    local_progress = 100.0
+
+                span = float(progress_end - progress_start)
+                scaled_progress = float(progress_start) + (local_progress / 100.0) * span
+                scaled_progress = max(0.0, min(100.0, scaled_progress))
+
+                self._emit(
+                    {
+                        'type': 'progress',
+                        'value': float(scaled_progress),
+                        'eta': f"ETA: {pass_name} {done_total}/{total_images}",
+                        'pass': pass_name,
+                        'done': done_total,
+                        'total': int(total_images),
+                    },
+                    level=LogLevel.DEBUG,
+                )
+
+                self._emit(
+                    {
+                        'type': 'log_update',
+                        'message': f"[*] {pass_name}: {folder_name} | {done_total}/{total_images} done",
+                    },
+                    level=LogLevel.DEBUG,
+                )
+
+            except Exception as write_err:
+                with stats_lock:
+                    stats['failed'] += 1
+
+                if isinstance(diag_ctx, dict) and bool(diag_ctx.get('enabled', False)):
+                    inflight = diag_ctx.get('inflight')
+                    inflight_lock = diag_ctx.get('inflight_lock')
+                    seq = item.get('global_seq') if isinstance(item, dict) else None
+                    if isinstance(inflight, dict) and hasattr(inflight_lock, 'acquire') and seq is not None:
+                        with inflight_lock:
+                            inflight.pop(int(seq), None)
+
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': f"[!!!] Writer error: {write_err}",
+                    },
+                    level=LogLevel.ERROR,
+                )
+            finally:
+                write_queue.task_done()
+
+    def _run_pass(
+        self,
+        pass_name,
+        stages,
+        grouped_by_folder,
+        output_path,
+        overwrite,
+        detailed_logs,
+        transfer_config,
+        source,
+        total_images,
+        progress_span,
+    ):
+        stats = {
+            'completed': 0,
+            'skipped': 0,
+            'failed': 0,
+            'cancelled': 0,
+            'folders_done': 0,
+        }
+
+        if total_images <= 0:
+            self._emit(
+                {
+                    'type': 'progress',
+                    'value': float(progress_span[1]),
+                    'eta': f'ETA: {pass_name} 0/0',
+                    'pass': pass_name,
+                    'done': 0,
+                    'total': 0,
+                },
+                level=LogLevel.DEBUG,
+            )
+            return stats
+
+        pass_stop_event = threading.Event()
+        stop_events = (self.terminate_event, pass_stop_event)
+        stats_lock = threading.Lock()
+        pass_started_at = time.monotonic()
+        diag_ctx = {
+            'enabled': bool(detailed_logs),
+            'pass_started_at': float(pass_started_at),
+            'last_progress_at': float(pass_started_at),
+            'inflight': {},
+            'inflight_lock': threading.Lock(),
+            'writer_lock': threading.Lock(),
+            'writer_last_report_at': float(pass_started_at),
+            'writer_last_done': 0,
+            'writer_samples_ms': [],
+        }
+
+        first_folder = list(grouped_by_folder.values())[0] if grouped_by_folder else []
+        queue_probe_folder = self._resolve_queue_probe_images(first_folder, output_path, source)
+        writer_worker_count = max(1, int(self.writer_threads))
+        queue_limits = self._queue_limits_for_folder(
+            queue_probe_folder,
+            transfer_config,
+            stages=stages,
+            writer_workers=writer_worker_count,
+        )
+
+        edge_debug = queue_limits.get('edge_debug', []) if isinstance(queue_limits, dict) else []
+        active_edge_keys = {
+            str(edge.get('key', ''))
+            for edge in edge_debug
+            if isinstance(edge, dict)
+        }
+        edge_labels = {
+            'decode_to_denoise': 'input->first-stage',
+            'denoise_to_colorize': 'denoise->colorize',
+            'colorize_to_upscale': 'colorize->upscale',
+            'upscale_to_write': 'last-stage->write',
+        }
+        active_edge_label_list = [
+            str(edge.get('label', edge_labels.get(edge.get('key', ''), edge.get('key', '?'))))
+            for edge in edge_debug
+            if isinstance(edge, dict)
+        ]
+        if active_edge_label_list:
+            active_edge_summary = ', '.join(active_edge_label_list)
+        else:
+            active_edge_summary = 'none'
+
+        def edge_cap_with_state(edge_key, short_name):
+            state = 'A' if edge_key in active_edge_keys else 'I'
+            return f"{short_name}:{int(queue_limits.get(edge_key, QUEUE_MIN_ITEMS))}[{state}]"
+
+        self._emit(
+            {
+                'type': 'log',
+                'message': (
+                    '[*] Queue caps => '
+                    f"{edge_cap_with_state('decode_to_denoise', 'decode')} "
+                    f"{edge_cap_with_state('denoise_to_colorize', 'denoise')} "
+                    f"{edge_cap_with_state('colorize_to_upscale', 'colorize')} "
+                    f"{edge_cap_with_state('upscale_to_write', 'write')} "
+                    f"(active edges: {active_edge_summary}; "
+                    f"budget {queue_limits['queue_budget_mb']} MB/{queue_limits.get('queue_budget_source', 'manual')}, "
+                    f"ram-cap {queue_limits.get('ram_queue_cap', QUEUE_MAX_ITEMS_CAP)})"
+                ),
+            },
+            level=LogLevel.DEBUG,
+        )
+
+        queue_edge_level = LogLevel.DEBUG if detailed_logs else LogLevel.TRACE
+
+        for edge in edge_debug:
+            self._emit(
+                {
+                    'type': 'log',
+                    'message': (
+                        '[*] Queue edge => '
+                        f"{edge.get('label', edge.get('key', '?'))} "
+                        f"cap:{edge.get('cap', '?')} "
+                        f"workers:{edge.get('workers', '?')} "
+                        f"bound:{edge.get('worker_bound', '?')} "
+                        f"item:{edge.get('item_mb', '?')} MB "
+                        f"budget:{edge.get('budget_mb', '?')} MB"
+                    ),
+                },
+                level=queue_edge_level,
+            )
+
+        for edge_key in ('decode_to_denoise', 'denoise_to_colorize', 'colorize_to_upscale', 'upscale_to_write'):
+            if edge_key in active_edge_keys:
+                continue
+            self._emit(
+                {
+                    'type': 'log',
+                    'message': (
+                        '[*] Queue edge => '
+                        f"{edge_labels.get(edge_key, edge_key)} inactive for this pass "
+                        f"(floor cap {int(queue_limits.get(edge_key, QUEUE_MIN_ITEMS))})."
+                    ),
+                },
+                level=queue_edge_level,
+            )
+
+        queues = {}
+        if 'denoise' in stages:
+            queues['to_denoise'] = queue.Queue(maxsize=queue_limits.get('decode_to_denoise', 12))
+            if 'colorize' in stages or 'upscale' in stages:
+                queues['from_denoise'] = queue.Queue(maxsize=queue_limits.get('denoise_to_colorize', 12))
+
+        if 'colorize' in stages:
+            if 'denoise' not in stages:
+                queues['to_colorize'] = queue.Queue(maxsize=queue_limits.get('decode_to_denoise', 12))
+            if 'upscale' in stages:
+                queues['from_colorize'] = queue.Queue(maxsize=queue_limits.get('colorize_to_upscale', 4))
+
+        if 'upscale' in stages and 'denoise' not in stages and 'colorize' not in stages:
+            queues['to_upscale'] = queue.Queue(maxsize=queue_limits.get('decode_to_denoise', 4))
+
+        write_queue = queue.Queue(maxsize=queue_limits.get('upscale_to_write', 4))
+        # Store write_queue ref so producer can access it in passthrough (Color Transfer Only) mode
+        queues['__write_queue'] = write_queue
+
+        active_chain = [s for s in ('denoise', 'colorize', 'upscale') if s in stages and s in self.pools]
+        stage_threads = {}
+        stage_in_queues = {}
+
+        for stage in active_chain:
+            in_q, out_q = self._get_stage_queues(stage, stages, queues, write_queue)
+            stage_in_queues[stage] = in_q
+            worker_count = max(1, int(self.worker_counts.get(stage, 1)))
+            threads = []
+            for _ in range(worker_count):
+                t = threading.Thread(
+                    target=self._persistent_stage_worker,
+                    args=(
+                        stage,
+                        in_q,
+                        out_q,
+                        stop_events,
+                        pass_stop_event,
+                        transfer_config,
+                        detailed_logs,
+                        diag_ctx,
+                    ),
+                    daemon=True,
+                )
+                threads.append(t)
+            stage_threads[stage] = threads
+
+        producer_thread = threading.Thread(
+            target=self._persistent_producer,
+            args=(
+                grouped_by_folder,
+                output_path,
+                overwrite,
+                detailed_logs,
+                transfer_config,
+                source,
+                stages,
+                queues,
+                stop_events,
+                pass_stop_event,
+                stats,
+                stats_lock,
+                diag_ctx,
+            ),
+            daemon=True,
+        )
+
+        writer_threads = []
+        for _ in range(writer_worker_count):
+            writer_thread = threading.Thread(
+                target=self._persistent_writer,
+                args=(
+                    write_queue,
+                    output_path,
+                    stop_events,
+                    stats,
+                    stats_lock,
+                    total_images,
+                    pass_name,
+                    detailed_logs,
+                    float(progress_span[0]),
+                    float(progress_span[1]),
+                    diag_ctx,
+                    transfer_config,
+                ),
+                daemon=True,
+            )
+            writer_threads.append(writer_thread)
+
+        queue_state_pairs = [
+            (name, q_obj)
+            for name, q_obj in (
+                ('to_denoise', queues.get('to_denoise')),
+                ('from_denoise', queues.get('from_denoise')),
+                ('to_colorize', queues.get('to_colorize')),
+                ('from_colorize', queues.get('from_colorize')),
+                ('to_upscale', queues.get('to_upscale')),
+                ('write', write_queue),
+            )
+            if q_obj is not None
+        ]
+
+        heartbeat_stop_event = threading.Event()
+        heartbeat_thread = None
+
+        def _join_thread_with_diag(thread_obj, label):
+            join_started = time.monotonic()
+            last_report = join_started
+            if detailed_logs:
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': f'[*] Join begin => {label}',
+                    },
+                    level=LogLevel.DEBUG,
+                )
+
+            while thread_obj.is_alive():
+                thread_obj.join(timeout=0.5)
+                now = time.monotonic()
+                if (
+                    thread_obj.is_alive()
+                    and self.terminate_event.is_set()
+                    and (now - join_started) >= QUEUE_DIAG_JOIN_ABORT_ON_STOP_S
+                ):
+                    if detailed_logs:
+                        self._emit(
+                            {
+                                'type': 'log',
+                                'message': (
+                                    '[!] Join aborted on stop => '
+                                    f'{label} '
+                                    f'elapsed:{max(0.0, now - join_started):.1f}s '
+                                    f'({self._stop_state_text(pass_stop_event)})'
+                                ),
+                            },
+                            level=LogLevel.WARNING,
+                        )
+                    return False
+
+                if detailed_logs and thread_obj.is_alive() and (now - last_report) >= QUEUE_DIAG_JOIN_REPORT_INTERVAL_S:
+                    self._emit(
+                        {
+                            'type': 'log',
+                            'message': (
+                                '[*] Join wait => '
+                                f'{label} '
+                                f'elapsed:{max(0.0, now - join_started):.1f}s '
+                                f'({self._stop_state_text(pass_stop_event)})'
+                            ),
+                        },
+                        level=LogLevel.DEBUG,
+                    )
+                    last_report = now
+
+            if detailed_logs:
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': (
+                            '[*] Join done => '
+                            f'{label} '
+                            f'elapsed:{max(0.0, time.monotonic() - join_started):.2f}s'
+                        ),
+                    },
+                    level=LogLevel.DEBUG,
+                )
+            return True
+
+        def _queue_join_with_diag(work_q, label):
+            def _drain_queue_now():
+                drained = 0
+                while True:
+                    try:
+                        queued_item = work_q.get_nowait()
+                    except queue.Empty:
+                        break
+
+                    if isinstance(queued_item, dict):
+                        queued_item['image'] = None
+                    try:
+                        work_q.task_done()
+                        drained += 1
+                    except ValueError:
+                        break
+                return drained
+
+            join_started = time.monotonic()
+            last_report = join_started
+            if detailed_logs:
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': f'[*] Queue join begin => {label} q:{_queue_state_text(work_q)}',
+                    },
+                    level=LogLevel.DEBUG,
+                )
+
+            while True:
+                pending = int(getattr(work_q, 'unfinished_tasks', 0) or 0)
+                if pending <= 0:
+                    break
+                time.sleep(0.2)
+                now = time.monotonic()
+
+                if (
+                    self.terminate_event.is_set()
+                    and (now - join_started) >= QUEUE_DIAG_JOIN_ABORT_ON_STOP_S
+                ):
+                    drained = _drain_queue_now()
+                    if detailed_logs:
+                        pending_after = int(getattr(work_q, 'unfinished_tasks', 0) or 0)
+                        self._emit(
+                            {
+                                'type': 'log',
+                                'message': (
+                                    '[!] Queue join aborted on stop => '
+                                    f'{label} '
+                                    f'pending_before:{pending} '
+                                    f'drained:{drained} '
+                                    f'pending_after:{pending_after} '
+                                    f'q:{_queue_state_text(work_q)} '
+                                    f'elapsed:{max(0.0, now - join_started):.1f}s '
+                                    f'({self._stop_state_text(pass_stop_event)})'
+                                ),
+                            },
+                            level=LogLevel.WARNING,
+                        )
+                    return False
+
+                if detailed_logs and (now - last_report) >= QUEUE_DIAG_JOIN_REPORT_INTERVAL_S:
+                    self._emit(
+                        {
+                            'type': 'log',
+                            'message': (
+                                '[*] Queue join wait => '
+                                f'{label} '
+                                f'pending:{pending} '
+                                f'q:{_queue_state_text(work_q)} '
+                                f'elapsed:{max(0.0, now - join_started):.1f}s '
+                                f'({self._stop_state_text(pass_stop_event)})'
+                            ),
+                        },
+                        level=LogLevel.DEBUG,
+                    )
+                    last_report = now
+
+            if detailed_logs:
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': (
+                            '[*] Queue join done => '
+                            f'{label} '
+                            f'elapsed:{max(0.0, time.monotonic() - join_started):.2f}s '
+                            f'q:{_queue_state_text(work_q)}'
+                        ),
+                    },
+                    level=LogLevel.DEBUG,
+                )
+            return True
+
+        if bool(diag_ctx.get('enabled', False)):
+            def _heartbeat_loop():
+                while not heartbeat_stop_event.wait(QUEUE_DIAG_HEARTBEAT_INTERVAL_S):
+                    now = time.monotonic()
+                    last_progress_at = float(diag_ctx.get('last_progress_at', pass_started_at) or pass_started_at)
+                    idle_seconds = max(0.0, now - last_progress_at)
+                    if idle_seconds < QUEUE_DIAG_HEARTBEAT_INTERVAL_S:
+                        continue
+
+                    system_stats = get_system_memory_stats_mb()
+                    if system_stats:
+                        avail_ram = int(system_stats.get('available_mb', 0) or 0)
+                        if avail_ram > 0 and avail_ram < int(QUEUE_RAM_PRESSURE_WARN_MB):
+                            self._emit(
+                                {
+                                    'type': 'log',
+                                    'message': (
+                                        '[!] RAM pressure: '
+                                        f'{avail_ram} MB free '
+                                        f'(headroom target: {QUEUE_RAM_HEADROOM_MB} MB)'
+                                    ),
+                                },
+                                level=LogLevel.WARNING,
+                            )
+
+                    with stats_lock:
+                        done_total = int(stats['completed'] + stats['skipped'] + stats['failed'] + stats['cancelled'])
+
+                    inflight = {}
+                    inflight_lock = diag_ctx.get('inflight_lock')
+                    raw_inflight = diag_ctx.get('inflight')
+                    if isinstance(raw_inflight, dict) and hasattr(inflight_lock, 'acquire'):
+                        with inflight_lock:
+                            inflight = dict(raw_inflight)
+
+                    oldest_inflight_s = 0.0
+                    if inflight:
+                        oldest_inflight_s = max(0.0, now - float(min(inflight.values())))
+
+                    queue_summary = ', '.join(
+                        f'{name}:{_queue_state_text(q_obj)}' for name, q_obj in queue_state_pairs
+                    ) or 'none'
+                    stage_summary = ', '.join(
+                        f'{stage}:{sum(1 for th in threads if th.is_alive())}/{len(threads)}'
+                        for stage, threads in stage_threads.items()
+                    ) or 'none'
+                    writer_alive = sum(1 for writer_th in writer_threads if writer_th.is_alive())
+                    producer_alive = int(producer_thread.is_alive())
+
+                    self._emit(
+                        {
+                            'type': 'log',
+                            'message': (
+                                '[*] Pass heartbeat => '
+                                f'idle:{idle_seconds:.1f}s '
+                                f'done:{done_total}/{total_images} '
+                                f'inflight:{len(inflight)} '
+                                f'oldest_inflight:{oldest_inflight_s:.1f}s '
+                                f'producer:{producer_alive} '
+                                f'stages:[{stage_summary}] '
+                                f'writer:{writer_alive}/{writer_worker_count} '
+                                f'queues:[{queue_summary}] '
+                                f'({self._stop_state_text(pass_stop_event)})'
+                            ),
+                        },
+                        level=LogLevel.DEBUG,
+                    )
+
+            heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+
+        for writer_thread in writer_threads:
+            writer_thread.start()
+        for stage in active_chain:
+            for thread in stage_threads[stage]:
+                thread.start()
+        producer_thread.start()
+        if heartbeat_thread is not None:
+            heartbeat_thread.start()
+
+        _join_thread_with_diag(producer_thread, f'{pass_name} producer')
+
+        if self.terminate_event.is_set():
+            self._drain_all_queues(write_queue, *queues.values())
+            heartbeat_stop_event.set()
+            for stage in active_chain:
+                for thread in stage_threads[stage]:
+                    thread.join(timeout=2.0)
+            for writer_thread in writer_threads:
+                writer_thread.join(timeout=2.0)
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=1.0)
+
+            with stats_lock:
+                done_total = int(stats['completed'] + stats['skipped'] + stats['failed'] + stats['cancelled'])
+
+            if total_images > 0:
+                local_progress = min(100.0, (done_total / float(total_images)) * 100.0)
+            else:
+                local_progress = 100.0
+            span = float(progress_span[1] - progress_span[0])
+            final_scaled = float(progress_span[0]) + (local_progress / 100.0) * span
+            final_scaled = max(0.0, min(100.0, final_scaled))
+            self._emit(
+                {
+                    'type': 'progress',
+                    'value': float(final_scaled),
+                    'eta': f"ETA: {pass_name} {done_total}/{total_images}",
+                    'pass': pass_name,
+                    'done': done_total,
+                    'total': int(total_images),
+                },
+                level=LogLevel.DEBUG,
+            )
+            return stats
+
+        if active_chain:
+            first_stage = active_chain[0]
+            first_in_q = stage_in_queues[first_stage]
+            _queue_join_with_diag(first_in_q, f'{pass_name} {first_stage} input')
+            for thread in stage_threads[first_stage]:
+                _join_thread_with_diag(thread, f'{pass_name} {first_stage} worker')
+
+            for next_idx in range(1, len(active_chain)):
+                next_stage = active_chain[next_idx]
+                next_in_q = stage_in_queues[next_stage]
+                next_worker_count = len(stage_threads[next_stage])
+
+                sentinel_started = time.monotonic()
+                sentinels_sent = 0
+                for _ in range(next_worker_count):
+                    if not self._force_put(
+                        next_in_q,
+                        None,
+                        pass_stop_event=pass_stop_event,
+                        queue_name=f'sentinel->{next_stage}',
+                        detailed_logs=detailed_logs,
+                    ):
+                        break
+                    sentinels_sent += 1
+
+                if detailed_logs:
+                    self._emit(
+                        {
+                            'type': 'log',
+                            'message': (
+                                '[*] Sentinel inject => '
+                                f'{next_stage} '
+                                f'sent:{sentinels_sent}/{next_worker_count} '
+                                f'elapsed:{max(0.0, time.monotonic() - sentinel_started):.2f}s '
+                                f'q:{_queue_state_text(next_in_q)}'
+                            ),
+                        },
+                        level=LogLevel.DEBUG,
+                    )
+
+                _queue_join_with_diag(next_in_q, f'{pass_name} {next_stage} input')
+                for thread in stage_threads[next_stage]:
+                    _join_thread_with_diag(thread, f'{pass_name} {next_stage} worker')
+
+        if pass_stop_event.is_set() and not self.terminate_event.is_set():
+            _queue_join_with_diag(write_queue, f'{pass_name} write (draining completed)')
+
+        writer_sentinel_started = time.monotonic()
+        writer_sentinels_sent = 0
+        for _ in range(writer_worker_count):
+            if not self._force_put(
+                write_queue,
+                None,
+                pass_stop_event=pass_stop_event,
+                queue_name='sentinel->write',
+                detailed_logs=detailed_logs,
+            ):
+                break
+            writer_sentinels_sent += 1
+
+        if detailed_logs:
+            self._emit(
+                {
+                    'type': 'log',
+                    'message': (
+                        '[*] Sentinel inject => '
+                        f'write '
+                        f'sent:{writer_sentinels_sent}/{writer_worker_count} '
+                        f'elapsed:{max(0.0, time.monotonic() - writer_sentinel_started):.2f}s '
+                        f'q:{_queue_state_text(write_queue)}'
+                    ),
+                },
+                level=LogLevel.DEBUG,
+            )
+
+        _queue_join_with_diag(write_queue, f'{pass_name} write')
+        for writer_thread in writer_threads:
+            _join_thread_with_diag(writer_thread, f'{pass_name} writer')
+
+        heartbeat_stop_event.set()
+        if heartbeat_thread is not None:
+            _join_thread_with_diag(heartbeat_thread, f'{pass_name} heartbeat')
+
+        if self.terminate_event.is_set() or pass_stop_event.is_set():
+            self._drain_all_queues(write_queue, *queues.values())
+
+        with stats_lock:
+            done_total = int(stats['completed'] + stats['skipped'] + stats['failed'] + stats['cancelled'])
+
+        if total_images > 0:
+            local_progress = min(100.0, (done_total / float(total_images)) * 100.0)
+        else:
+            local_progress = 100.0
+        span = float(progress_span[1] - progress_span[0])
+        final_scaled = float(progress_span[0]) + (local_progress / 100.0) * span
+        final_scaled = max(0.0, min(100.0, final_scaled))
+        self._emit(
+            {
+                'type': 'progress',
+                'value': float(final_scaled),
+                'eta': f"ETA: {pass_name} {done_total}/{total_images}",
+                'pass': pass_name,
+                'done': done_total,
+                'total': int(total_images),
+            },
+            level=LogLevel.DEBUG,
+        )
+
+        return stats
+
+    def run_batch(
+        self,
+        grouped_by_folder,
+        output_path,
+        overwrite,
+        detailed_logs=False,
+        transfer_config=None,
+    ):
+        transfer_config = transfer_config or self.config
+        grouped_by_folder = OrderedDict(grouped_by_folder or {})
+
+        total_folders = len(grouped_by_folder)
+        total_images = sum(len(images) for images in grouped_by_folder.values())
+
+        batch_stats = {
+            'completed': 0,
+            'skipped': 0,
+            'failed': 0,
+            'cancelled': 0,
+            'pass1_folders_done': 0,
+            'pass2_folders_done': 0,
+        }
+
+        pass1_stages = []
+        if callable(self.model_factories.get('denoise')) and int(self.instance_counts.get('denoise', 0)) > 0:
+            pass1_stages.append('denoise')
+        if callable(self.model_factories.get('colorize')) and int(self.instance_counts.get('colorize', 0)) > 0:
+            pass1_stages.append('colorize')
+
+        need_pass1 = bool(pass1_stages)
+        need_pass2 = bool(callable(self.model_factories.get('upscale')) and int(self.instance_counts.get('upscale', 0)) > 0)
+        
+        external_enabled = bool(getattr(transfer_config, 'external_color_source_enabled', False))
+
+        if not need_pass1 and not need_pass2 and not external_enabled:
+            self._emit({'type': 'log', 'message': '[!] No stages enabled.'}, level=LogLevel.WARNING)
+            self._emit_pass_state('complete', 'No stages enabled.')
+            self._emit_terminal('complete', 'No stages enabled.')
+            return batch_stats
+
+        if need_pass1:
+            self._emit_pass_state('pass1', 'Pass 1 started')
+            self._emit(
+                {
+                    'type': 'log',
+                    'message': f"[*] === Pass 1: {'+'.join(s.title() for s in pass1_stages)} ({total_folders} folders, {total_images} images) ===",
+                },
+                level=LogLevel.DEBUG,
+            )
+            self._create_pools(pass1_stages)
+            self._run_stage_warmup_calibration()
+            self._emit_calibration_report()
+
+            pass1_progress_span = (0.0, 50.0) if need_pass2 else (0.0, 100.0)
+            pass1_stats = self._run_pass(
+                pass_name='Pass 1',
+                stages=pass1_stages,
+                grouped_by_folder=grouped_by_folder,
+                output_path=output_path,
+                overwrite=overwrite,
+                detailed_logs=detailed_logs,
+                transfer_config=transfer_config,
+                source='input',
+                total_images=total_images,
+                progress_span=pass1_progress_span,
+            )
+
+            for key in ('completed', 'skipped', 'failed', 'cancelled'):
+                batch_stats[key] += int(pass1_stats.get(key, 0))
+            batch_stats['pass1_folders_done'] = int(pass1_stats.get('folders_done', 0))
+            self._unload_pools(pass1_stages)
+            gc.collect()
+            clear_torch_cache()
+
+        if need_pass2 and not self.terminate_event.is_set():
+            if batch_stats['failed'] > 0 and self.fail_fast:
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': '[!] Skipping Pass 2 (upscale) due to Pass 1 failures.',
+                    },
+                    level=LogLevel.WARNING,
+                )
+            else:
+                # Determine source and image count based on whether pass1 ran
+                external_enabled = bool(
+                    getattr(transfer_config, 'external_color_source_enabled', False)
+                )
+                if need_pass1:
+                    pass2_source = 'output'
+                    # Use pass1 completed count instead of scanning the filesystem
+                    # (which was slow for large batches with many folders).
+                    pass2_image_count = int(pass1_stats.get('completed', 0)) + int(pass1_stats.get('skipped', 0))
+                    if pass2_image_count <= 0:
+                        pass2_image_count = self._count_pass1_outputs(grouped_by_folder, output_path)
+                else:
+                    # Pass1 was skipped (e.g. external color source mode) - read from input
+                    pass2_source = 'input'
+                    pass2_image_count = total_images
+
+                # Build external color map if enabled
+                if external_enabled:
+                    ext_dir = str(getattr(transfer_config, 'external_color_source_dir', '') or '')
+                    self._external_color_map, ext_warnings = build_external_color_map(
+                        grouped_by_folder, ext_dir,
+                    )
+                    for w in ext_warnings:
+                        self._emit(
+                            {'type': 'log', 'message': f'[!] External color: {w}'},
+                            level=LogLevel.WARNING,
+                        )
+                    matched_count = len(self._external_color_map)
+                    self._emit(
+                        {
+                            'type': 'log',
+                            'message': f'[*] External color source: matched {matched_count}/{pass2_image_count} images',
+                        },
+                        level=LogLevel.DEBUG,
+                    )
+
+                pass2_label = 'Upscale + External Color' if external_enabled else 'Upscale'
+                self._emit_pass_state('pass2', 'Pass 2 started')
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': f'[*] === Pass 2: {pass2_label} ({pass2_image_count} images) ===',
+                    },
+                    level=LogLevel.DEBUG,
+                )
+
+                self.cuda_baseline_stats = get_cuda_memory_stats_mb()
+                self._create_pools(['upscale'])
+                self._run_stage_warmup_calibration()
+                self._apply_adaptive_upscale_worker_limit()
+                self._emit_calibration_report()
+
+                pass2_progress_span = (50.0, 100.0) if need_pass1 else (0.0, 100.0)
+                pass2_stats = self._run_pass(
+                    pass_name='Pass 2',
+                    stages=['upscale'],
+                    grouped_by_folder=grouped_by_folder,
+                    output_path=output_path,
+                    overwrite=True,
+                    detailed_logs=detailed_logs,
+                    transfer_config=transfer_config,
+                    source=pass2_source,
+                    total_images=pass2_image_count,
+                    progress_span=pass2_progress_span,
+                )
+
+                for key in ('completed', 'skipped', 'failed', 'cancelled'):
+                    batch_stats[key] += int(pass2_stats.get(key, 0))
+                batch_stats['pass2_folders_done'] = int(pass2_stats.get('folders_done', 0))
+                self._unload_pools(['upscale'])
+
+        # --- Color Transfer Only pass (no upscale, external color enabled) ---
+        # When the user has pre-upscaled BW images and only wants to apply color transfer.
+        elif not need_pass2 and not self.terminate_event.is_set():
+            external_enabled = bool(
+                getattr(transfer_config, 'external_color_source_enabled', False)
+            )
+            if external_enabled:
+                ext_dir = str(getattr(transfer_config, 'external_color_source_dir', '') or '')
+                self._external_color_map, ext_warnings = build_external_color_map(
+                    grouped_by_folder, ext_dir,
+                )
+                for w in ext_warnings:
+                    self._emit(
+                        {'type': 'log', 'message': f'[!] External color: {w}'},
+                        level=LogLevel.WARNING,
+                    )
+                matched_count = len(self._external_color_map)
+                ct_image_count = total_images if not need_pass1 else (
+                    int(pass1_stats.get('completed', 0)) + int(pass1_stats.get('skipped', 0))
+                )
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': f'[*] External color source: matched {matched_count}/{ct_image_count} images',
+                    },
+                    level=LogLevel.DEBUG,
+                )
+
+                ct_source = 'output' if need_pass1 else 'input'
+                ct_label = 'Color Transfer Only'
+                self._emit_pass_state('pass2', 'Color Transfer pass started')
+                self._emit(
+                    {
+                        'type': 'log',
+                        'message': f'[*] === {ct_label} ({ct_image_count} images) ===',
+                    },
+                    level=LogLevel.DEBUG,
+                )
+
+                # No GPU pools needed — just read, apply color transfer, write
+                ct_progress_span = (50.0, 100.0) if need_pass1 else (0.0, 100.0)
+                ct_stats = self._run_pass(
+                    pass_name='Color Transfer',
+                    stages=[],  # No GPU stages — writer applies color transfer
+                    grouped_by_folder=grouped_by_folder,
+                    output_path=output_path,
+                    overwrite=True,
+                    detailed_logs=detailed_logs,
+                    transfer_config=transfer_config,
+                    source=ct_source,
+                    total_images=ct_image_count,
+                    progress_span=ct_progress_span,
+                )
+
+                for key in ('completed', 'skipped', 'failed', 'cancelled'):
+                    batch_stats[key] += int(ct_stats.get(key, 0))
+                batch_stats['pass2_folders_done'] = int(ct_stats.get('folders_done', 0))
+
+        if self.terminate_event.is_set():
+            self._emit_pass_state('complete', 'Batch cancelled')
+            self._emit_terminal('cancelled', 'Batch cancelled by user')
+        elif batch_stats['failed'] > 0 and self.fail_fast:
+            self._emit_pass_state('complete', 'Batch finished with failure policy stop')
+            self._emit_terminal('failed', 'Batch stopped by failure policy')
+        else:
+            self._emit_pass_state('complete', 'Batch complete')
+            self._emit_terminal('complete', 'Batch complete')
+
+        self._emit(
+            {
+                'type': 'progress',
+                'value': 100.0,
+                'eta': 'ETA: Done!',
+                'pass': 'complete',
+                'done': int(batch_stats['completed'] + batch_stats['skipped'] + batch_stats['failed'] + batch_stats['cancelled']),
+                'total': int(total_images),
+            },
+            level=LogLevel.DEBUG,
+        )
+        return batch_stats
+
+    def process_folder(
+        self,
+        folder_images,
+        output_path,
+        rel_dir,
+        overwrite,
+        detailed_logs=False,
+        transfer_config=None,
+    ):
+        grouped = OrderedDict()
+        grouped[rel_dir] = list(folder_images or [])
+        result = self.run_batch(
+            grouped_by_folder=grouped,
+            output_path=output_path,
+            overwrite=overwrite,
+            detailed_logs=detailed_logs,
+            transfer_config=transfer_config,
+        )
+        return {
+            'completed': int(result.get('completed', 0)),
+            'skipped': int(result.get('skipped', 0)),
+            'failed': int(result.get('failed', 0)),
+            'cancelled': int(result.get('cancelled', 0)),
+            'results': [],
+            'stop_requested': bool(self.terminate_event.is_set()),
+        }
+
+    def shutdown(self):
+        stages_to_drain = list(self.pools.keys())
+        if stages_to_drain:
+            self._unload_pools(stages_to_drain)
+        self.model_factories.clear()
+        self.instance_vram_observed_mb.clear()
+        self.stage_peak_inference_mb.clear()

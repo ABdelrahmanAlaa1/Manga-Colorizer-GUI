@@ -1,5 +1,8 @@
 import argparse
 import base64
+import warnings
+# Suppress Triton's warning about not finding CUDA on startup
+warnings.filterwarnings("ignore", category=UserWarning, module="triton")
 import io
 import json
 import random
@@ -206,7 +209,7 @@ def denoise_image(rid, image, denoiser, sigma):
 
 def colorize_image(rid, image, colorizer, size):
     start_time = time.time()
-    colorizer.set_image((image.astype('float32') / 255), size)
+    colorizer.set_image(image, size)
     colorized_image = colorizer.colorize()
     elapsed_time = time.time() - start_time
     print(f'[+] [{rid}] Colorized image {[*image.shape]}->{[*colorized_image.shape]} in {elapsed_time:.2f} seconds.')
@@ -215,7 +218,7 @@ def colorize_image(rid, image, colorizer, size):
 
 def upscale_image(rid, image, upscaler, factor):
     start_time = time.time()
-    upscaled_image = upscaler.upscale((image.astype('float32') / 255), factor)
+    upscaled_image = upscaler.upscale(image, factor)
     elapsed_time = time.time() - start_time
     print(f'[+] [{rid}] Upscaled image (x{factor}) {[*image.shape]}->{[*upscaled_image.shape]} in {elapsed_time:.2f} seconds.')
     return upscaled_image
@@ -241,7 +244,7 @@ if __name__ == '__main__':
     parser.add_argument('--colorizer_path', default='networks/generator.zip')
     parser.add_argument('--extractor_path', default='networks/extractor.pth')
     parser.add_argument('--upscaler_path', default='networks/RealESRGAN_x4plus_anime_6B.pt')
-    parser.add_argument('--upscaler_type', choices=['ESRGAN', 'GigaGAN'], default='ESRGAN')
+    parser.add_argument('--upscaler_type', choices=['Auto-Detect', 'GigaGAN'], default='Auto-Detect')
 
     parser.add_argument('--no-ssl', dest='ssl', action='store_false', default=True, help='Disable SSL context.')
     parser.add_argument('--no-upscale', dest='upscale', action='store_false', default=True, help='Disable upscaling')

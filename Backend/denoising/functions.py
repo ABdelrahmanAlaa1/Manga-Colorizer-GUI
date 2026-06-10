@@ -27,7 +27,6 @@ def concatenate_input_noise_map(input, noise_sigma):
     """
     # noise_sigma is a list of length batch_size
     N, C, H, W = input.size()
-    dtype = input.type()
     sca = 2
     sca2 = sca*sca
     Cout = sca2*C
@@ -35,11 +34,8 @@ def concatenate_input_noise_map(input, noise_sigma):
     Wout = W//sca
     idxL = [[0, 0], [0, 1], [1, 0], [1, 1]]
 
-    # Fill the downsampled image with zeros
-    if 'cuda' in dtype:
-        downsampledfeatures = torch.cuda.FloatTensor(N, Cout, Hout, Wout).fill_(0)
-    else:
-        downsampledfeatures = torch.FloatTensor(N, Cout, Hout, Wout).fill_(0)
+    # Keep tensor creation on the same device/dtype as input.
+    downsampledfeatures = input.new_zeros((N, Cout, Hout, Wout))
 
     # Build the CxH/2xW/2 noise map
     noise_map = noise_sigma.view(N, 1, 1, 1).repeat(1, C, Hout, Wout)

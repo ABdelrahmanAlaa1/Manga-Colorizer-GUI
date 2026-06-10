@@ -4,6 +4,9 @@ matplotlib
 numpy
 opencv_python_headless
 scikit_image
+spandrel>=0.4.0
+safetensors>=0.4.0
+einops>=0.7.0
 # torch
 # torchvision
 # Instead of including PyTorch in this file, 

@@ -1,0 +1,1334 @@
+"""
+Manga Text Detection Engine — Detection-only OCR for manga text masking.
+
+Runs OCR once per image, caches all intermediate results,
+and exposes the final mask for manual editing without re-running OCR.
+
+Supports PaddleOCR (primary) and EasyOCR (fallback) backends.
+English-only detection to avoid Japanese SFX false positives.
+"""
+
+import os
+import sys
+import time
+import hashlib
+import numpy as np
+import cv2
+
+# Fix for PaddleOCR 3.5 + modelscope crash
+os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
+
+# Suppress invisible matplotlib windows spawned by PaddleOCR/PaddleX
+os.environ['MPLBACKEND'] = 'Agg'
+
+# Suppress PaddleX/VisualDL GUI windows
+os.environ['VISUALDL_SERVER_HOST'] = '127.0.0.1'
+os.environ['FLAGS_use_mkldnn'] = '0'
+os.environ.setdefault('PADDLE_DISABLE_VISUALDL', '1')
+os.environ.setdefault('PADDLE_NO_CUDA_BLOCKING', '1')
+
+# --- Monkey-patch subprocess.Popen to suppress console windows on Windows ---
+# PaddlePaddle's cpp_extension calls `where ccache` via subprocess which spawns
+# visible terminal windows. This patch adds CREATE_NO_WINDOW flag to all Popen
+# calls made by PaddlePaddle internals.
+if sys.platform == 'win32':
+    import subprocess as _subprocess
+    _orig_popen_init = _subprocess.Popen.__init__
+
+    def _silent_popen_init(self, *args, **kwargs):
+        if 'creationflags' not in kwargs:
+            kwargs['creationflags'] = _subprocess.CREATE_NO_WINDOW
+        return _orig_popen_init(self, *args, **kwargs)
+
+    _subprocess.Popen.__init__ = _silent_popen_init
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+except ImportError:
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Detection Result Container
+# ---------------------------------------------------------------------------
+class DetectionResult:
+    """Immutable snapshot of one OCR detection run."""
+    __slots__ = (
+        'image_path', 'image_hash', 'raw_boxes', 'bubble_mask',
+        'sfx_mask', 'combined_mask', 'timestamp', 'image_shape',
+    )
+
+    def __init__(self, image_path, image_hash, raw_boxes, bubble_mask,
+                 sfx_mask, combined_mask, image_shape):
+        self.image_path = image_path
+        self.image_hash = image_hash
+        self.raw_boxes = raw_boxes
+        self.bubble_mask = bubble_mask
+        self.sfx_mask = sfx_mask
+        self.combined_mask = combined_mask
+        self.image_shape = image_shape
+        self.timestamp = time.time()
+
+
+# ---------------------------------------------------------------------------
+# Main Detector Class
+# ---------------------------------------------------------------------------
+class MangaTextDetector:
+    """
+    Detection-only OCR for manga text masking.
+
+    Usage::
+
+        detector = MangaTextDetector(engine='paddle')
+        result = detector.detect(grayscale_image, config)
+        mask = result.combined_mask  # ready for luminance transfer
+    """
+
+    def __init__(self):
+        self._paddle_reader = None
+        self._easyocr_reader = None
+        self._cache = {}          # image_hash -> DetectionResult
+        self._cache_max = 8       # keep last N results
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def detect(self, L_source, config=None):
+        """
+        Run YOLO-primary detection pipeline on a grayscale image.
+
+        Pipeline:
+          Step 0: YOLO bubble detection
+          Step 1: Post-process (validate + filter FPs)
+          Step 2: Contour refinement (bbox → actual shape)
+          Step 3: (optional, 'full' mode) OCR text → SFX extraction
+          Step 4: Combine + smooth
+
+        Returns a DetectionResult with bubble_mask, sfx_mask, combined_mask.
+        """
+        image_hash = self._fast_hash(L_source)
+        current_path = getattr(config, 'current_image_path', None)
+
+        # Check cache
+        cached = self._cache.get(image_hash)
+        if cached is not None and cached.image_shape == L_source.shape:
+            return cached
+
+        # Read config
+        engine = getattr(config, 'ocr_engine', 'paddle') if config else 'paddle'
+        export_ocr = getattr(config, 'export_ocr_debug', False) if config else False
+        yolo_raw = getattr(config, 'use_yolo_bubbles', 'full') if config else 'full'
+        log_cb = getattr(config, 'ocr_status_callback', None)
+        fp_strictness = getattr(config, 'fp_strictness', 0.5) if config else 0.5
+
+        # Normalize yolo mode
+        if yolo_raw is True or yolo_raw == 'full':
+            run_ocr = True
+        elif yolo_raw == 'yolo_only':
+            run_ocr = False
+        elif yolo_raw is False or yolo_raw == 'off':
+            # No detection at all — return empty mask
+            empty = np.zeros(L_source.shape[:2], dtype=np.uint8)
+            result = DetectionResult(
+                image_path=current_path, image_hash=image_hash,
+                image_shape=L_source.shape, raw_boxes=[],
+                bubble_mask=empty, sfx_mask=empty, combined_mask=empty,
+            )
+            self._cache[image_hash] = result
+            return result
+        else:
+            run_ocr = True  # default to full
+
+        h, w = L_source.shape[:2]
+        img_area = h * w
+
+        # ---- Step 0a: YOLO bubble detection ----
+        if log_cb:
+            log_cb("Detecting speech bubbles (YOLO)...")
+        yolo_bubbles, yolo_bubble_mask = self._detect_yolo_bubbles(
+            L_source, config
+        )
+
+        # ---- Step 0b: OCR text detection (BEFORE validation) ----
+        text_mask = np.zeros((h, w), dtype=np.uint8)
+        raw_boxes = []
+
+        if run_ocr:
+            if log_cb:
+                log_cb("Detecting text regions (OCR)...")
+            raw_boxes = self._detect_text(L_source, engine, config)
+
+            # Build text mask from OCR boxes
+            for bbox in raw_boxes:
+                pts = np.array(bbox, np.int32).reshape((-1, 1, 2))
+                cv2.fillPoly(text_mask, [pts], 255)
+
+        # ---- Step 1: Cross-validate bubbles using text_mask ----
+        if yolo_bubbles is not None:
+            validated = self._postprocess_bubbles(
+                yolo_bubbles, L_source, text_mask, fp_strictness
+            )
+            if log_cb:
+                removed = len(yolo_bubbles) - len(validated)
+                log_cb(f"Validated {len(validated)} bubbles "
+                       f"({removed} FPs removed)")
+        else:
+            validated = []
+
+        # ---- Step 2: Contour refinement ----
+        if validated:
+            if log_cb:
+                log_cb("Refining bubble contours...")
+            bubble_mask = self._refine_contours(L_source, validated)
+        else:
+            bubble_mask = np.zeros((h, w), dtype=np.uint8)
+
+        # ---- Step 3: SFX extraction ----
+        sfx_mask = np.zeros((h, w), dtype=np.uint8)
+
+        if run_ocr:
+            # SFX extraction (floating text outside bubbles)
+            if log_cb:
+                log_cb("Processing SFX regions...")
+            sfx_mask = self._detect_floating_sfx(
+                L_source, text_mask, bubble_mask, config
+            )
+
+        # ---- Step 4: Combine + smooth ----
+        combined_mask = cv2.max(bubble_mask, sfx_mask)
+        blur_ksize = self._kernel_scale_odd(9, w)
+        combined_mask = cv2.GaussianBlur(
+            combined_mask, (blur_ksize, blur_ksize), 0
+        )
+
+        # ---- Debug overlays ----
+        if export_ocr:
+            self._save_debug_overlays(
+                L_source, text_mask, bubble_mask, sfx_mask,
+                combined_mask, config,
+                yolo_bubble_mask=yolo_bubble_mask,
+            )
+
+        # ---- Cache ----
+        result = DetectionResult(
+            image_path=current_path,
+            image_hash=image_hash,
+            raw_boxes=raw_boxes,
+            bubble_mask=bubble_mask,
+            sfx_mask=sfx_mask,
+            combined_mask=combined_mask,
+            image_shape=L_source.shape,
+        )
+        self._cache_put(image_hash, result)
+
+        mode_str = "full" if run_ocr else "yolo_only"
+        print(f"[OCR] {mode_str}: {len(validated)} bubbles, "
+              f"{len(raw_boxes)} text boxes, "
+              f"mask={np.count_nonzero(combined_mask)} px")
+
+        # Free OCR readers to release VRAM for colorization model
+        if run_ocr:
+            self.free_readers()
+
+        return result
+
+    def invalidate_cache(self, image_path=None):
+        """Clear cache for a specific image or all."""
+        if image_path is None:
+            self._cache.clear()
+        else:
+            to_remove = [
+                k for k, v in self._cache.items()
+                if v.image_path == image_path
+            ]
+            for k in to_remove:
+                del self._cache[k]
+
+    def free_readers(self):
+        """Release OCR reader VRAM."""
+        cleared = False
+        if self._paddle_reader is not None:
+            self._paddle_reader = None
+            cleared = True
+        if self._easyocr_reader is not None:
+            self._easyocr_reader = None
+            cleared = True
+        if cleared:
+            import gc
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Text Detection Backends
+    # ------------------------------------------------------------------
+    def _detect_text(self, L_source, engine, config):
+        """
+        Run text detection and return a list of bounding-box polygons
+        in original image coordinates.  Supports quality mode (with
+        recognition scores for adaptive filtering) and fast mode
+        (detection-only + heuristic filtering).
+        """
+        max_ocr_dim = getattr(config, 'max_ocr_dimension', 3072) if config else 3072
+        # CLAHE mode: 'both', 'original', 'clahe' (backwards compat: True→both, False→original)
+        clahe_raw = getattr(config, 'ocr_clahe', 'both') if config else 'both'
+        if clahe_raw is True:
+            clahe_mode = 'both'
+        elif clahe_raw is False:
+            clahe_mode = 'original'
+        else:
+            clahe_mode = str(clahe_raw).lower()
+        quality_mode = getattr(config, 'ocr_quality_mode', True) if config else True
+
+        h, w = L_source.shape[:2]
+        longest = max(h, w)
+
+        # Dynamic scaling
+        scale_factor = 1.0
+        ocr_source = L_source
+        if longest != max_ocr_dim:
+            scale_factor = max_ocr_dim / float(longest)
+            new_w = int(w * scale_factor)
+            new_h = int(h * scale_factor)
+            ocr_source = cv2.resize(
+                L_source, (new_w, new_h),
+                interpolation=cv2.INTER_LANCZOS4
+            )
+
+        # CLAHE contrast enhancement
+        if clahe_mode in ('both', 'clahe'):
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            ocr_enhanced = clahe.apply(ocr_source)
+        else:
+            ocr_enhanced = None
+
+        run_original = clahe_mode in ('both', 'original')
+        run_clahe = clahe_mode in ('both', 'clahe') and ocr_enhanced is not None
+
+        # Returns list of (box, score_or_None) tuples
+        all_detections = []
+        t0 = time.time()
+        if engine == 'paddle':
+            all_detections = self._detect_paddle(
+                ocr_source, ocr_enhanced, scale_factor, config, quality_mode,
+                run_original, run_clahe
+            )
+        else:
+            all_detections = self._detect_easyocr(
+                ocr_source, ocr_enhanced, scale_factor, config, quality_mode,
+                run_original, run_clahe
+            )
+        elapsed = time.time() - t0
+        print(f"[OCR] Raw detection: {len(all_detections)} boxes in {elapsed:.1f}s "
+              f"(engine={engine}, quality={quality_mode})")
+
+        # ---- False positive filtering ----
+        filtered_boxes = self._filter_false_positives(
+            all_detections, L_source, quality_mode
+        )
+        print(f"[OCR] After filtering: {len(filtered_boxes)} boxes "
+              f"(removed {len(all_detections) - len(filtered_boxes)})")
+
+        return filtered_boxes
+
+    def _detect_paddle(self, ocr_source, ocr_enhanced, scale_factor, config, quality_mode,
+                        run_original=True, run_clahe=True):
+        """PaddleOCR backend. Returns list of (box, score_or_None) tuples."""
+        reader = self._get_paddle_reader(config)
+        if reader is None:
+            return []
+
+        detections = []
+
+        # Pass 1: Normal image
+        if run_original:
+            ocr_input = cv2.cvtColor(ocr_source, cv2.COLOR_GRAY2BGR)
+            detections.extend(self._paddle_extract_boxes(
+                reader, ocr_input, scale_factor, quality_mode
+            ))
+
+        # Pass 2: CLAHE-enhanced (catches faint text)
+        if run_clahe and ocr_enhanced is not None:
+            enhanced_bgr = cv2.cvtColor(ocr_enhanced, cv2.COLOR_GRAY2BGR)
+            detections.extend(self._paddle_extract_boxes(
+                reader, enhanced_bgr, scale_factor, quality_mode
+            ))
+
+        return detections
+
+    def _paddle_extract_boxes(self, reader, bgr_image, scale_factor, quality_mode):
+        """
+        Extract detection polygons from PaddleOCR.
+
+        Quality mode: uses predict() which runs both det+rec, returns
+        (box, rec_score) tuples for adaptive confidence filtering.
+
+        Fast mode: uses predict() but discards rec_scores — all boxes pass
+        to heuristic filtering only.  PaddleOCR v3.5 doesn't support
+        ocr(rec=False), so the speed gain comes from skipping CLAHE pass
+        and using looser filtering thresholds.
+        """
+        detections = []
+        try:
+            # predict() always runs det+rec in PaddleOCR v3.5
+            results = reader.predict(bgr_image)
+            if results:
+                for res in results:
+                    polys = res.get('dt_polys', [])
+                    scores = res.get('rec_scores', [])
+                    for idx, poly in enumerate(polys):
+                        poly_arr = np.array(poly, dtype=np.float64)
+                        if scale_factor != 1.0:
+                            poly_arr = poly_arr / scale_factor
+                        if quality_mode:
+                            score = scores[idx] if idx < len(scores) else None
+                        else:
+                            score = None  # fast mode: ignore rec scores
+                        detections.append(
+                            (poly_arr.astype(np.int32).tolist(), score)
+                        )
+        except Exception as e:
+            print(f"[OCR] PaddleOCR detection failed: {e}")
+            import traceback
+            traceback.print_exc()
+        return detections
+
+    def _detect_easyocr(self, ocr_source, ocr_enhanced, scale_factor, config, quality_mode,
+                        run_original=True, run_clahe=True):
+        """EasyOCR backend. Returns list of (box, score_or_None) tuples."""
+        reader = self._get_easyocr_reader(config)
+        if reader is None:
+            return []
+
+        det_thresh = getattr(config, 'ocr_det_confidence', 0.3) if config else 0.3
+        detections = []
+
+        # Pass 1: Normal image
+        if run_original:
+            detections.extend(self._easyocr_extract_boxes(
+                reader, ocr_source, scale_factor, det_thresh, quality_mode
+            ))
+
+        # Pass 2: CLAHE-enhanced
+        if run_clahe and ocr_enhanced is not None:
+            detections.extend(self._easyocr_extract_boxes(
+                reader, ocr_enhanced, scale_factor, det_thresh, quality_mode
+            ))
+
+        return detections
+
+    def _easyocr_extract_boxes(self, reader, gray_image, scale_factor, threshold, quality_mode):
+        """
+        Extract detection boxes from EasyOCR.
+
+        Quality mode: uses readtext() which runs det+rec, returns
+        (box, prob) tuples.  This is what the OLD working system used.
+
+        Fast mode: uses detect() for detection-only, returns (box, None).
+        """
+        detections = []
+        try:
+            if quality_mode:
+                # readtext() returns (bbox, text, prob) — full pipeline
+                results = reader.readtext(gray_image)
+                for bbox, text, prob in results:
+                    poly = [[int(p[0]), int(p[1])] for p in bbox]
+                    if scale_factor != 1.0:
+                        poly = [
+                            [int(p[0] / scale_factor), int(p[1] / scale_factor)]
+                            for p in poly
+                        ]
+                    detections.append((poly, prob))
+            else:
+                # detect() returns (horizontal_list, free_list) — det only
+                horizontal, free = reader.detect(
+                    gray_image,
+                    text_threshold=threshold,
+                    low_text=0.3,
+                    link_threshold=0.3,
+                )
+                if horizontal and horizontal[0]:
+                    for h_box in horizontal[0]:
+                        x_min, x_max, y_min, y_max = h_box
+                        poly = [
+                            [x_min, y_min], [x_max, y_min],
+                            [x_max, y_max], [x_min, y_max]
+                        ]
+                        if scale_factor != 1.0:
+                            poly = [
+                                [int(p[0] / scale_factor), int(p[1] / scale_factor)]
+                                for p in poly
+                            ]
+                        detections.append((poly, None))
+                if free and free[0]:
+                    for f_poly in free[0]:
+                        poly = np.array(f_poly, dtype=np.float64)
+                        if scale_factor != 1.0:
+                            poly = poly / scale_factor
+                        detections.append((poly.astype(np.int32).tolist(), None))
+        except Exception as e:
+            print(f"[OCR] EasyOCR detection failed: {e}")
+            import traceback
+            traceback.print_exc()
+        return detections
+
+    # ------------------------------------------------------------------
+    # False Positive Filtering (4-layer)
+    # ------------------------------------------------------------------
+    def _filter_false_positives(self, detections, L_source, quality_mode):
+        """
+        Multi-layer filter to remove false positive detections.
+
+        Parameters
+        ----------
+        detections : list of (box, score_or_None)
+        L_source : grayscale image
+        quality_mode : bool, if True scores are available
+
+        Returns
+        -------
+        list of box (polygon) — filtered, without scores
+        """
+        if not detections:
+            return []
+
+        h, w = L_source.shape[:2]
+        image_area = h * w
+
+        # --- Layer 1: Adaptive Score Filtering (quality mode only) ---
+        scored = []
+        for box, score in detections:
+            if score is not None and quality_mode:
+                if score < 0.05:
+                    continue  # Definitely not text
+                # score 0.05-0.25: keep but will be scrutinized by layers 2-3
+                # score >= 0.25: accept
+            scored.append((box, score))
+
+        # --- Layer 2: Geometric Heuristics ---
+        geometric = []
+        for box, score in scored:
+            pts = np.array(box, np.int32)
+            x, y, bw, bh = cv2.boundingRect(pts)
+            area = bw * bh
+
+            # Too small (noise) or too large (panels/backgrounds)
+            min_area = image_area * 0.0002
+            max_area = image_area * 0.02
+            if area < min_area or area > max_area:
+                continue
+
+            # Extreme aspect ratio (panel borders, lines)
+            aspect = max(bw, bh) / max(min(bw, bh), 1)
+            if aspect > 12:
+                continue
+
+            geometric.append((box, score))
+
+        # --- Layer 3: Luminance Interior Check ---
+        luma_filtered = []
+        for box, score in geometric:
+            pts = np.array(box, np.int32)
+            x, y, bw, bh = cv2.boundingRect(pts)
+            # Clamp to image bounds
+            x = max(0, x)
+            y = max(0, y)
+            x2 = min(w, x + bw)
+            y2 = min(h, y + bh)
+            if x2 <= x or y2 <= y:
+                continue
+
+            roi = L_source[y:y2, x:x2]
+            mean_luma = float(roi.mean())
+            std_luma = float(roi.std())
+
+            # High-confidence boxes (score >= 0.25) skip luma check
+            if score is not None and score >= 0.25:
+                luma_filtered.append(box)
+                continue
+
+            # Reject complex lineart regions: medium brightness + high variance
+            # Real text is on white (high mean) or is contrasted ink
+            if 80 < mean_luma < 160 and std_luma > 50:
+                continue  # Likely complex lineart, not text
+
+            luma_filtered.append(box)
+
+        # --- Layer 4: NMS Deduplication ---
+        if len(luma_filtered) > 1:
+            final_boxes = self._nms_boxes(luma_filtered, iou_threshold=0.5)
+        else:
+            final_boxes = luma_filtered
+
+        return final_boxes
+
+    @staticmethod
+    def _nms_boxes(boxes, iou_threshold=0.5):
+        """Non-Maximum Suppression on polygon bounding boxes."""
+        if not boxes:
+            return []
+
+        # Convert to axis-aligned bounding rects for IoU
+        rects = []
+        for box in boxes:
+            pts = np.array(box, np.int32)
+            x, y, bw, bh = cv2.boundingRect(pts)
+            rects.append((x, y, x + bw, y + bh, bw * bh))
+
+        # Sort by area (largest first)
+        indices = sorted(range(len(rects)), key=lambda i: rects[i][4], reverse=True)
+        keep = []
+        suppressed = set()
+
+        for i in indices:
+            if i in suppressed:
+                continue
+            keep.append(i)
+            x1_a, y1_a, x2_a, y2_a, area_a = rects[i]
+
+            for j in indices:
+                if j <= i or j in suppressed:
+                    continue
+                x1_b, y1_b, x2_b, y2_b, area_b = rects[j]
+
+                # Intersection
+                ix1 = max(x1_a, x1_b)
+                iy1 = max(y1_a, y1_b)
+                ix2 = min(x2_a, x2_b)
+                iy2 = min(y2_a, y2_b)
+                iw = max(0, ix2 - ix1)
+                ih = max(0, iy2 - iy1)
+                inter = iw * ih
+
+                # Union
+                union = area_a + area_b - inter
+                if union > 0 and float(inter) / union > iou_threshold:
+                    suppressed.add(j)
+
+        return [boxes[i] for i in keep]
+
+    # ------------------------------------------------------------------
+    # Reader Initialization
+    # ------------------------------------------------------------------
+    def _get_paddle_reader(self, config=None):
+        """Lazy-initialize PaddleOCR reader."""
+        if self._paddle_reader is not None:
+            return self._paddle_reader
+
+        try:
+            import torch
+            has_gpu = torch.cuda.is_available()
+        except ImportError:
+            has_gpu = False
+
+        try:
+            print(f"[OCR] Initializing PaddleOCR on "
+                  f"{'GPU' if has_gpu else 'CPU'}...")
+            from paddleocr import PaddleOCR
+            self._paddle_reader = PaddleOCR(
+                lang='en',
+                device='gpu:0' if has_gpu else 'cpu',
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+            )
+            print("[OCR] PaddleOCR loaded successfully.")
+        except Exception as e:
+            import traceback
+            print(f"[OCR] Failed to load PaddleOCR: {e}")
+            traceback.print_exc()
+            self._paddle_reader = None
+        return self._paddle_reader
+
+    def _get_easyocr_reader(self, config=None):
+        """Lazy-initialize EasyOCR reader."""
+        if self._easyocr_reader is not None:
+            return self._easyocr_reader
+
+        try:
+            import torch
+            has_gpu = torch.cuda.is_available()
+        except ImportError:
+            has_gpu = False
+
+        use_fp16 = getattr(config, 'easyocr_fp16', True) if config else True
+
+        try:
+            print(f"[OCR] Initializing EasyOCR on "
+                  f"{'GPU' if has_gpu else 'CPU'}...")
+            import easyocr
+            self._easyocr_reader = easyocr.Reader(
+                ['en'], gpu=has_gpu, verbose=False
+            )
+            # FP16 acceleration
+            if has_gpu and use_fp16:
+                try:
+                    det_model = self._easyocr_reader.detector
+                    # Handle DataParallel wrapper
+                    if hasattr(det_model, 'module'):
+                        det_model.module.half()
+                    elif hasattr(det_model, 'model'):
+                        det_model.model.half()
+                    else:
+                        det_model.half()
+                    print("[OCR] EasyOCR FP16 enabled.")
+                except Exception as e:
+                    print(f"[OCR] EasyOCR FP16 failed: {e}")
+
+            print("[OCR] EasyOCR loaded successfully.")
+        except Exception as e:
+            import traceback
+            print(f"[OCR] Failed to load EasyOCR: {e}")
+            traceback.print_exc()
+            self._easyocr_reader = None
+        return self._easyocr_reader
+
+    # ------------------------------------------------------------------
+    # YOLO Bubble Detection
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Bubble Validation & FP Removal
+    # ------------------------------------------------------------------
+    def _score_bubble(self, bubble, L_source, ocr_text_mask,
+                      fp_strictness=0.5):
+        """
+        Score a single YOLO bubble using weighted multi-factor analysis.
+
+        Instead of binary pass/fail checks, computes a composite score
+        from 5 factors.  The dominant signal is OCR text overlap (35%),
+        which rescues valid dark bubbles and eliminates bright non-text FPs.
+
+        fp_strictness: 0.0 = permissive, 1.0 = aggressive FP removal.
+        Returns (score: float, is_valid: bool).
+        """
+        x1, y1, x2, y2 = bubble['bbox']
+        conf = bubble.get('confidence', 0.5)
+        h, w = L_source.shape[:2]
+        img_area = h * w
+
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw <= 0 or bh <= 0:
+            return 0.0, False
+
+        area = bw * bh
+
+        # ---- Hard rejects (geometry, not scoreable) ----
+        if area < 200:  # Tiny noise
+            return 0.0, False
+        if area > img_area * 0.30:  # Panel-sized, not a bubble
+            return 0.0, False
+        ratio = max(bw, bh) / max(min(bw, bh), 1)
+        if ratio > 6.0:  # Extreme aspect ratio
+            return 0.0, False
+
+        # Clamp ROI to image bounds
+        cx1 = max(0, x1)
+        cy1 = max(0, y1)
+        cx2 = min(w, x2)
+        cy2 = min(h, y2)
+        roi = L_source[cy1:cy2, cx1:cx2]
+        if roi.size == 0:
+            return 0.0, False
+
+        score = 0.0
+        has_text_data = (ocr_text_mask is not None and ocr_text_mask.any())
+
+        # ------ Hard reject: very low YOLO confidence ------
+        if conf < 0.40:
+            return 0.0, False
+
+        # ------ Factor 1 (25%): Tiered YOLO confidence ------
+        if conf >= 0.90:
+            score += 0.25 * 1.0
+        elif conf >= 0.70:
+            score += 0.25 * (conf / 0.90)
+        elif conf >= 0.50:
+            score += 0.25 * (conf / 0.90) * 0.6
+        else:
+            score += 0.25 * (conf / 0.90) * 0.3
+
+        # ------ Factor 2 (25%): OCR text overlap ------
+        text_overlap = 0.0
+        if has_text_data:
+            text_roi = ocr_text_mask[cy1:cy2, cx1:cx2]
+            text_pixels = int(np.count_nonzero(text_roi))
+            text_overlap = text_pixels / max(area, 1)
+            score += 0.25 * min(text_overlap / 0.03, 1.0)
+
+        # ------ Factor 3 (10%): Brightness ------
+        mean_brightness = float(roi.mean())
+        brightness_score = float(np.clip(
+            (mean_brightness - 100.0) / 100.0, 0.0, 1.0
+        ))
+        score += 0.10 * brightness_score
+
+        # ------ Factor 4 (10%): Edge density ------
+        edges = cv2.Canny(roi, 50, 150)
+        edge_ratio = float(edges.mean()) / 255.0
+        edge_score = 1.0 - min(edge_ratio / 0.25, 1.0)
+        score += 0.10 * edge_score
+
+        # ------ Factor 5 (10%): White-fill ratio ------
+        white_pixels = int(np.count_nonzero(roi > 200))
+        white_ratio = white_pixels / max(roi.size, 1)
+        score += 0.10 * min(white_ratio / 0.3, 1.0)
+
+        # ------ Factor 6 (10%): Interior uniformity ------
+        # Bubbles = uniform white interior (low stdev)
+        # Faces/detail = complex patterns (high stdev)
+        roi_std = float(roi.std())
+        # Bubbles typically have stdev < 40; faces/detail > 60
+        uniformity = float(np.clip(1.0 - (roi_std - 20.0) / 60.0, 0.0, 1.0))
+        score += 0.10 * uniformity
+
+        # ------ Factor 7 (10%): Shape regularity ------
+        # Bubbles are roughly convex. Irregular shapes = likely FP.
+        if 'mask' in bubble and bubble['mask'] is not None:
+            seg = bubble['mask']
+            seg_coords = cv2.findNonZero(seg)
+            if seg_coords is not None and len(seg_coords) > 5:
+                hull = cv2.convexHull(seg_coords)
+                hull_area = cv2.contourArea(hull)
+                seg_area_px = np.count_nonzero(seg)
+                solidity = seg_area_px / max(hull_area, 1)
+                # Bubbles are convex (solidity > 0.85)
+                # Complex shapes (solidity < 0.6) are likely FP
+                shape_score = float(np.clip(
+                    (solidity - 0.5) / 0.4, 0.0, 1.0
+                ))
+            else:
+                shape_score = 0.5
+        else:
+            shape_score = 0.5  # No mask, neutral
+        score += 0.10 * shape_score
+
+        # ------ Adaptive threshold ------
+        threshold = 0.30 + fp_strictness * 0.15
+
+        # No OCR text data → raise threshold
+        if not has_text_data:
+            threshold += 0.10
+
+        # Compound FP penalty: low conf + no text + high detail
+        if conf < 0.70 and text_overlap < 0.005:
+            if has_text_data:
+                threshold += 0.10
+            # High interior detail → almost certainly not a bubble
+            if roi_std > 50:
+                threshold += 0.10
+
+        # Very high detail inside = hard penalty regardless of conf
+        if roi_std > 70 and conf < 0.80:
+            threshold += 0.08
+
+        # Debug scoring detail
+        x1, y1, x2, y2 = bubble['bbox']
+        print(f"    [DETAIL] bbox=({x1},{y1},{x2},{y2}) conf={conf:.2f} "
+              f"score={score:.3f} thr={threshold:.3f} "
+              f"text={text_overlap:.4f} bright={mean_brightness:.0f} "
+              f"std={roi_std:.1f} shape={shape_score:.2f} "
+              f"{'PASS' if score >= threshold else 'FAIL'}")
+
+        return score, score >= threshold
+
+    def _postprocess_bubbles(self, yolo_bubbles, L_source,
+                             ocr_text_mask=None, fp_strictness=0.5):
+        """
+        Filter YOLO bubble detections using multi-factor scoring.
+
+        Returns a list of validated bubbles sorted by score (highest first).
+        """
+        validated = []
+        rejected = []
+        for bubble in yolo_bubbles:
+            score, is_valid = self._score_bubble(
+                bubble, L_source, ocr_text_mask, fp_strictness
+            )
+            conf = bubble.get('confidence', 0)
+            x1, y1, x2, y2 = bubble['bbox']
+
+            if is_valid:
+                bubble['_score'] = score
+                validated.append(bubble)
+                print(f"  [SCORE] ✓ PASS conf={conf:.2f} score={score:.3f} "
+                      f"bbox=({x1},{y1},{x2},{y2})")
+            else:
+                rejected.append((conf, score))
+                print(f"  [SCORE] ✗ FAIL conf={conf:.2f} score={score:.3f} "
+                      f"bbox=({x1},{y1},{x2},{y2})")
+
+        print(f"[OCR] Scoring: {len(validated)} accepted, "
+              f"{len(rejected)} rejected out of {len(yolo_bubbles)} total")
+
+        # Sort by composite score (highest first)
+        validated.sort(key=lambda b: b.get('_score', 0), reverse=True)
+        return validated
+
+    # ------------------------------------------------------------------
+    # YOLO Bubble Detection
+    # ------------------------------------------------------------------
+    def _detect_yolo_bubbles(self, L_source, config):
+        """
+        Run YOLO speech bubble detector.
+
+        Supports segmentation model (pixel masks) and detection model
+        (bounding boxes only).  When both are available and config
+        requests 'both', merges results from seg + det models.
+
+        Returns (bubbles_list, raw_mask) or (None, None).
+        """
+        try:
+            from Backend.bubble_detector import get_bubble_detector
+            detector = get_bubble_detector()
+
+            t0 = time.time()
+            bubbles = detector.detect(L_source, conf=0.35, imgsz=1024)
+            elapsed = time.time() - t0
+
+            seg_status = 'seg' if detector.has_segmentation else 'det'
+            has_masks = any('mask' in b for b in (bubbles or []))
+
+            if bubbles:
+                raw_mask = detector.create_bubble_mask(
+                    L_source.shape, bubbles
+                )
+                print(f"[YOLO] Detected {len(bubbles)} bubbles in "
+                      f"{elapsed:.1f}s (model={seg_status}, "
+                      f"masks={'yes' if has_masks else 'no'})")
+                # Free YOLO from VRAM before OCR runs
+                detector.free()
+                return bubbles, raw_mask
+            else:
+                print(f"[YOLO] No bubbles detected ({elapsed:.1f}s, "
+                      f"model={seg_status})")
+                detector.free()
+                return None, None
+
+        except ImportError as e:
+            print(f"[YOLO] Not available: {e}")
+            return None, None
+        except Exception as e:
+            print(f"[YOLO] Detection failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None
+
+    def _refine_contours(self, L_source, validated_bubbles):
+        """
+        Refine validated YOLO detections into actual bubble contours.
+
+        When YOLO segmentation masks are available (seg model), uses
+        the pixel-perfect masks directly — no threshold guessing needed.
+
+        When only bounding boxes are available (det model), falls back
+        to Otsu-based threshold refinement within each bbox ROI.
+
+        Returns a refined bubble mask (uint8, same size as L_source).
+        """
+        h, w = L_source.shape[:2]
+        refined_mask = np.zeros((h, w), dtype=np.uint8)
+        ks = lambda base: self._kernel_scale(base, w)
+        used_seg = 0
+        used_threshold = 0
+
+        for bubble in validated_bubbles:
+            # ---- Path A: Pixel-perfect contours guided by YOLO ----
+            # YOLO bbox+15% = WHERE to search (ensures full bubble coverage)
+            # Path B's threshold+contour = HOW to find edges (pixel-perfect)
+            # Seg mask = WHICH contour is the right bubble (overlap test)
+            if 'mask' in bubble and bubble['mask'] is not None:
+                seg_mask = bubble['mask']
+                if seg_mask.shape[:2] != (h, w):
+                    seg_mask = cv2.resize(seg_mask, (w, h),
+                                          interpolation=cv2.INTER_LINEAR)
+                    seg_mask = (seg_mask > 127).astype(np.uint8) * 255
+
+                # Use bbox expanded by 15% to ensure full bubble coverage
+                x1, y1, x2, y2 = bubble['bbox']
+                bw = x2 - x1
+                bh = y2 - y1
+                expand_x = max(ks(10), int(bw * 0.15))
+                expand_y = max(ks(10), int(bh * 0.15))
+                rx1 = max(0, x1 - expand_x)
+                ry1 = max(0, y1 - expand_y)
+                rx2 = min(w, x2 + expand_x)
+                ry2 = min(h, y2 + expand_y)
+
+                if rx2 - rx1 < 10 or ry2 - ry1 < 10:
+                    refined_mask = cv2.max(refined_mask, seg_mask)
+                    used_seg += 1
+                    continue
+
+                roi = L_source[ry1:ry2, rx1:rx2]
+                seg_roi = seg_mask[ry1:ry2, rx1:rx2]
+
+                # Same proven threshold approach as Path B
+                _, roi_binary = cv2.threshold(
+                    roi, 230, 255, cv2.THRESH_BINARY
+                )
+
+                white_ratio = np.count_nonzero(roi_binary) / max(roi_binary.size, 1)
+                if white_ratio < 0.15:
+                    otsu_thresh, roi_binary = cv2.threshold(
+                        roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                    )
+                    if otsu_thresh < 150:
+                        roi_binary = cv2.adaptiveThreshold(
+                            roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                            cv2.THRESH_BINARY, 21, 5
+                        )
+
+                # Morphological open to clean noise
+                morph_k = max(3, ks(3))
+                kernel = np.ones((morph_k, morph_k), np.uint8)
+                roi_binary = cv2.morphologyEx(
+                    roi_binary, cv2.MORPH_OPEN, kernel
+                )
+
+                # Find contours — pixel-perfect edges
+                contours, _ = cv2.findContours(
+                    roi_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+
+                if not contours:
+                    # No contours — fall back to raw seg mask
+                    refined_mask = cv2.max(refined_mask, seg_mask)
+                    used_seg += 1
+                    continue
+
+                # Pick the contour with the MOST overlap with seg mask
+                # (seg mask tells us which bright region is the bubble)
+                best_contour = None
+                best_overlap = 0
+                roi_area = roi.shape[0] * roi.shape[1]
+
+                for c in contours:
+                    c_area = cv2.contourArea(c)
+                    if c_area < roi_area * 0.03:
+                        continue  # Skip tiny noise
+
+                    # Draw this contour and check overlap with seg mask
+                    c_mask = np.zeros_like(seg_roi)
+                    cv2.drawContours(c_mask, [c], -1, 255, -1)
+                    overlap = np.count_nonzero(
+                        cv2.bitwise_and(c_mask, seg_roi)
+                    )
+
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_contour = c
+
+                if best_contour is not None:
+                    offset_contour = best_contour.copy()
+                    offset_contour[:, :, 0] += rx1
+                    offset_contour[:, :, 1] += ry1
+                    cv2.drawContours(
+                        refined_mask, [offset_contour], -1, 255, -1
+                    )
+                else:
+                    # No matching contour — fall back to seg mask
+                    refined_mask = cv2.max(refined_mask, seg_mask)
+
+                used_seg += 1
+                continue
+
+            # ---- Path B: Threshold-based refinement (det model) ----
+            x1, y1, x2, y2 = bubble['bbox']
+            pad = ks(10)
+            rx1 = max(0, x1 - pad)
+            ry1 = max(0, y1 - pad)
+            rx2 = min(w, x2 + pad)
+            ry2 = min(h, y2 + pad)
+
+            if rx2 - rx1 < 10 or ry2 - ry1 < 10:
+                cv2.rectangle(refined_mask, (x1, y1), (x2, y2), 255, -1)
+                used_threshold += 1
+                continue
+
+            roi = L_source[ry1:ry2, rx1:rx2]
+
+            # Use fixed 230 threshold (proven stable for white bubbles)
+            # with Otsu fallback for gray bubbles
+            _, roi_binary = cv2.threshold(roi, 230, 255, cv2.THRESH_BINARY)
+
+            # Check if the fixed threshold found enough white area
+            white_ratio = np.count_nonzero(roi_binary) / max(roi_binary.size, 1)
+            if white_ratio < 0.15:
+                # Not enough white — try Otsu for gray bubbles
+                otsu_thresh, roi_binary = cv2.threshold(
+                    roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                )
+                if otsu_thresh < 150:
+                    roi_binary = cv2.adaptiveThreshold(
+                        roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                        cv2.THRESH_BINARY, 21, 5
+                    )
+
+            # Morphological open to clean noise
+            morph_k = max(3, ks(3))
+            kernel = np.ones((morph_k, morph_k), np.uint8)
+            roi_binary = cv2.morphologyEx(roi_binary, cv2.MORPH_OPEN, kernel)
+
+            # Find contours in ROI
+            contours, _ = cv2.findContours(
+                roi_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            if not contours:
+                cv2.rectangle(refined_mask, (x1, y1), (x2, y2), 255, -1)
+                used_threshold += 1
+                continue
+
+            # Pick the largest contour
+            best_contour = None
+            best_area = 0
+            roi_area = (rx2 - rx1) * (ry2 - ry1)
+
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area < roi_area * 0.05:
+                    continue
+                if area > best_area:
+                    best_area = area
+                    best_contour = c
+
+            if best_contour is not None:
+                offset_contour = best_contour.copy()
+                offset_contour[:, :, 0] += rx1
+                offset_contour[:, :, 1] += ry1
+                cv2.drawContours(
+                    refined_mask, [offset_contour], -1, 255, -1
+                )
+            else:
+                cv2.rectangle(refined_mask, (x1, y1), (x2, y2), 255, -1)
+            used_threshold += 1
+
+        # Dilate slightly to cover anti-aliased edges
+        dilate_k = ks(3)
+        refined_mask = cv2.dilate(
+            refined_mask,
+            np.ones((dilate_k, dilate_k), np.uint8),
+            iterations=1
+        )
+        print(f"[OCR] Contour refinement: {used_seg} seg masks, "
+              f"{used_threshold} threshold-based")
+        return refined_mask
+
+    # ------------------------------------------------------------------
+    # (geometry-based _detect_bubbles RETIRED in Phase 3A)
+    # YOLO is now the sole bubble detector — see _detect_yolo_bubbles()
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Floating SFX Detection
+    # ------------------------------------------------------------------
+    def _detect_floating_sfx(self, L_source, text_mask, bubble_mask, config):
+        """
+        Extract floating SFX text (text outside speech bubbles).
+
+        Uses the old 2-step approach from transfer_quality.py.bak:
+        1. Wide inpainting cloud (15px dilation) — for cv2.inpaint only
+        2. Tight halo (3px dilation at 50% opacity) — the visible SFX mask
+        """
+        if not np.any(text_mask):
+            return np.zeros_like(L_source)
+
+        ks = lambda base: self._kernel_scale(base, L_source.shape[1])
+        log_cb = getattr(config, 'ocr_status_callback', None)
+
+        # Adaptive threshold to find exact ink strokes within OCR boxes
+        local_thresh = cv2.adaptiveThreshold(
+            L_source, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 21, 10
+        )
+        local_thresh_white = cv2.adaptiveThreshold(
+            L_source, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 21, -10
+        )
+        combined_text = cv2.bitwise_or(local_thresh, local_thresh_white)
+
+        # Isolate strokes within OCR bounding boxes
+        exact_text_pixels = cv2.bitwise_and(combined_text, text_mask)
+
+        # Remove screentone noise via connected components
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            exact_text_pixels, connectivity=8
+        )
+        clean_text = np.zeros_like(exact_text_pixels)
+        min_stroke_area = ks(10)
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] >= min_stroke_area:
+                clean_text[labels == i] = 255
+
+        # Remove strokes inside bubbles — remaining are floating SFX
+        floating_text = clean_text.copy()
+        floating_text[bubble_mask > 127] = 0
+
+        if not np.any(floating_text):
+            return np.zeros_like(L_source)
+
+        if log_cb:
+            log_cb("Processing SFX regions...")
+
+        # ---- Step 1: Inpainting cloud (INVISIBLE — not the final mask) ----
+        # This will be used by transfer_quality to inpaint the background,
+        # but is NOT part of the visible SFX mask.
+        # We store it as a temporary attribute for transfer_quality to use.
+        soft_k = ks(15)
+        inpaint_cloud = cv2.dilate(
+            floating_text,
+            np.ones((soft_k, soft_k), np.uint8),
+            iterations=2
+        )
+        self._last_sfx_inpaint_cloud = inpaint_cloud
+
+        # ---- Step 2: Tight visible halo (1-2px at 50% opacity) ----
+        # This is the ACTUAL SFX mask that gets blended into the output.
+        # 3px kernel dilation, 1 iteration → ~1-2px border around strokes.
+        tight_k = ks(3)
+        tight_halo = cv2.dilate(
+            floating_text,
+            np.ones((tight_k, tight_k), np.uint8),
+            iterations=1
+        )
+        # 50% opacity: scale from 0-255 to 0-127
+        sfx_mask = (tight_halo.astype(np.uint16) * 127 // 255).astype(np.uint8)
+
+        return sfx_mask
+
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _kernel_scale(base_val, image_width):
+        return max(base_val, int(base_val * (image_width / 1796.0)))
+
+    @staticmethod
+    def _kernel_scale_odd(base_val, image_width):
+        val = MangaTextDetector._kernel_scale(base_val, image_width)
+        return val if val % 2 != 0 else val + 1
+
+    @staticmethod
+    def _fast_hash(image):
+        """Quick hash of image content for cache keying."""
+        # Sample sparse pixels for speed instead of hashing entire image
+        h, w = image.shape[:2]
+        sample = image[::max(1, h // 32), ::max(1, w // 32)]
+        return hashlib.md5(sample.tobytes()).hexdigest()
+
+    def _cache_put(self, key, result):
+        self._cache[key] = result
+        # Evict oldest if over capacity
+        while len(self._cache) > self._cache_max:
+            oldest_key = min(
+                self._cache, key=lambda k: self._cache[k].timestamp
+            )
+            del self._cache[oldest_key]
+
+    def _save_debug_overlays(self, L_source, text_mask, bubble_mask,
+                             sfx_mask, combined_mask, config,
+                             yolo_bubble_mask=None):
+        """Write debug overlay images when export_ocr_debug is enabled."""
+        ocr_debug_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "ocr_debug"
+        )
+        os.makedirs(ocr_debug_dir, exist_ok=True)
+
+        current_path = getattr(config, 'current_image_path', None)
+        basename = "debug"
+        if current_path:
+            basename = os.path.splitext(os.path.basename(current_path))[0]
+
+        def overlay(mask, name, color_ch=2):
+            vis = cv2.cvtColor(L_source, cv2.COLOR_GRAY2BGR)
+            colored = np.zeros_like(vis)
+            # Ensure mask is 2D
+            m = mask.squeeze() if mask.ndim > 2 else mask
+            colored[:, :, color_ch] = m
+            out = cv2.addWeighted(vis, 0.5, colored, 0.5, 0)
+            cv2.imwrite(
+                os.path.join(ocr_debug_dir, f"{basename}_{name}.jpg"), out
+            )
+
+        overlay(text_mask, "01_raw_ocr_bboxes")
+        overlay(bubble_mask, "02_speech_bubbles")
+        overlay(sfx_mask, "03_floating_sfx")
+        overlay(combined_mask, "04_final_combined")
+
+        # YOLO bubbles in green channel for comparison
+        if yolo_bubble_mask is not None:
+            overlay(yolo_bubble_mask, "05_yolo_bubbles", color_ch=1)
+
+        # Scoring detail overlay — annotate each YOLO bbox with score
+        if yolo_bubble_mask is not None:
+            score_vis = cv2.cvtColor(L_source, cv2.COLOR_GRAY2BGR)
+            # Re-run scoring to get per-bubble scores for visualization
+            yolo_raw = getattr(config, 'use_yolo_bubbles', 'full')
+            if yolo_raw not in (False, 'off'):
+                try:
+                    from Backend.bubble_detector import get_bubble_detector
+                    det = get_bubble_detector()
+                    raw_bubs = det.detect(L_source, conf=0.35, imgsz=1024)
+                    fp_s = getattr(config, 'fp_strictness', 0.5)
+                    for b in (raw_bubs or []):
+                        sc, valid = self._score_bubble(
+                            b, L_source, text_mask, fp_s
+                        )
+                        bx1, by1, bx2, by2 = b['bbox']
+                        color = (0, 255, 0) if valid else (0, 0, 255)
+                        cv2.rectangle(score_vis, (bx1, by1),
+                                      (bx2, by2), color, 2)
+                        label = f"{sc:.2f}"
+                        cv2.putText(
+                            score_vis, label, (bx1, by1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            color, 1, cv2.LINE_AA
+                        )
+                except Exception:
+                    pass
+            cv2.imwrite(
+                os.path.join(ocr_debug_dir,
+                             f"{basename}_06_scoring_detail.jpg"),
+                score_vis
+            )
+
+        # Log — count text_mask nonzero regions as proxy for box count
+        num_boxes = np.count_nonzero(text_mask) // 100  # rough estimate
+        with open(os.path.join(ocr_debug_dir, "log.txt"), "a") as f:
+            f.write(
+                f"[{time.strftime('%H:%M:%S')}] "
+                f"path={current_path}, text_px={np.count_nonzero(text_mask)}, "
+                f"bubbles={np.count_nonzero(bubble_mask)}, "
+                f"yolo={'yes' if yolo_bubble_mask is not None else 'no'}\n"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+_detector = None
+
+
+def get_detector():
+    """Get or create the global MangaTextDetector singleton."""
+    global _detector
+    if _detector is None:
+        _detector = MangaTextDetector()
+    return _detector
+
+
+def free_detector():
+    """Release the global detector and its VRAM."""
+    global _detector
+    if _detector is not None:
+        _detector.free_readers()
+        _detector = None

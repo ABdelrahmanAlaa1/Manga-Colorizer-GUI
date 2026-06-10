@@ -10,6 +10,7 @@ from utils.utils import distance_from_grayscale, save_image, clear_torch_cache
 
 def process_image(image_path, output_folder, colorizer, upscaler, denoiser, config):
     image_name = os.path.basename(image_path)
+    config.current_image_path = image_path
     image = Image.open(image_path).convert("RGB")
     image = np.array(image)
     
@@ -24,12 +25,12 @@ def process_image(image_path, output_folder, colorizer, upscaler, denoiser, conf
     
     if config.colorize:
         print(f"[*] Colorizing {image_name}...")
-        colorizer.set_image((image.astype('float32') / 255), config.colorized_image_size)
+        colorizer.set_image(image, config.colorized_image_size)
         image = colorizer.colorize()
     
     if config.upscale:
         print(f"[*] Upscaling {image_name} by {config.upscale_factor}x...")
-        image = upscaler.upscale((image.astype('float32') / 255), config.upscale_factor)
+        image = upscaler.upscale(image, config.upscale_factor)
     
     output_path = os.path.join(output_folder, image_name)
     save_image(image, output_path)
@@ -45,7 +46,7 @@ def main():
     parser.add_argument('--colorizer_path', default='networks/generator.zip')
     parser.add_argument('--extractor_path', default='networks/extractor.pth')
     parser.add_argument('--upscaler_path', default='networks/RealESRGAN_x4plus_anime_6B.pt')
-    parser.add_argument('--upscaler_type', choices=['ESRGAN', 'GigaGAN'], default='ESRGAN')
+    parser.add_argument('--upscaler_type', choices=['Auto-Detect', 'GigaGAN'], default='Auto-Detect')
 
     parser.add_argument('--no-upscale', dest='upscale', action='store_false', default=True, help='Disable upscaling')
     parser.add_argument('--no-colorize', dest='colorize', action='store_false', default=True,

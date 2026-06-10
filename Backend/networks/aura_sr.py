@@ -801,7 +801,7 @@ class Upscaler(nn.Module):
         return self.generator.device
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def upscale_4x(image, upsampler, input_image_size=64, max_batch_size=8):
     tensor_transform = transforms.ToTensor()
     device = upsampler.device
@@ -836,7 +836,7 @@ def upscale_4x(image, upsampler, input_image_size=64, max_batch_size=8):
 
 # Tiled 4x upscaling with overlapping tiles to reduce seam artifacts
 # weights options are 'checkboard' and 'constant'
-@torch.no_grad()
+@torch.inference_mode()
 def upscale_4x_overlapped(image, upsampler, input_image_size=64, max_batch_size=8, weight_type='checkboard'):
     tensor_transform = transforms.ToTensor()
     device = upsampler.device

@@ -1,3 +1,5 @@
+# DEPRECATED: This file is kept for backward compatibility and potential reference.
+# All active model routing and execution now goes through spandrel in `model_router.py`.
 #https://github.com/XPixelGroup/BasicSR/blob/master/basicsr/archs/rrdbnet_arch.py
 #https://github.com/XPixelGroup/BasicSR/blob/master/basicsr/archs/arch_util.py
 import torch
@@ -138,6 +140,7 @@ class RRDBNet(nn.Module):
             feat = pixel_unshuffle(x, scale=4)
         else:
             feat = x
+
         feat = self.conv_first(feat)
         body_feat = self.conv_body(self.body(feat))
         feat = feat + body_feat
